@@ -36,6 +36,7 @@ add_library(rush-engine STATIC
     src/core/config_impl.cpp
     src/core/paths_impl.cpp
     src/core/version.cpp
+    src/job/job_impl.cpp
     src/physics/qu3e_impl.cpp
     src/physics/nudge_impl.cpp
     src/physics/vehicle_impl.cpp
@@ -49,6 +50,7 @@ target_sources(rush-engine PUBLIC
         modules/physics.cppm
         modules/render.cppm
         modules/events.cppm
+        modules/job.cppm
 )
 
 add_library(rush::engine ALIAS rush-engine)
