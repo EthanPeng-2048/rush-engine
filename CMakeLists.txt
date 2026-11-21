@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.28)
+﻿cmake_minimum_required(VERSION 3.28)
 project(rush-engine VERSION 0.1.0 LANGUAGES CXX C)
 
 # C++23: exstl needs std::expected; public API is C++20 named modules.
@@ -38,6 +38,7 @@ add_library(rush-engine STATIC
     src/core/version.cpp
     src/physics/qu3e_impl.cpp
     src/physics/nudge_impl.cpp
+    src/physics/vehicle_impl.cpp
     src/render/null_impl.cpp
 )
 target_sources(rush-engine PUBLIC
