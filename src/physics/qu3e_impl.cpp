@@ -154,6 +154,9 @@ void Qu3eWorld::Step(float dt) {
     impl_->pendingForces.clear();
     (void)dt;  // q3Scene advances by the dt fixed at construction (1/240).
     impl_->scene.Step();
+    // Async: publish contacts to CollisionBus; consumers Drain on their stage.
+    for (const ContactEvent& e : impl_->contacts) CollisionBus().Publish(e);
+    impl_->contacts.clear();
 }
 
 BodyHandle Qu3eWorld::CreateBody(const BodyDesc& desc) {
@@ -284,7 +287,7 @@ RayHit Qu3eWorld::Raycast(const Vec3& origin, const Vec3& direction, float maxDi
 
 std::vector<ContactEvent> Qu3eWorld::DrainContacts() {
     std::vector<ContactEvent> out;
-    out.swap(impl_->contacts);
+    CollisionBus().Drain(out);
     return out;
 }
 

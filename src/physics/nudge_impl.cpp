@@ -225,7 +225,7 @@ void NudgeWorld::Step(float dt) {
         const auto itB = impl_->bodies.find(event.bodyB);
         event.userDataA = itA != impl_->bodies.end() ? itA->second.desc.userData : nullptr;
         event.userDataB = itB != impl_->bodies.end() ? itB->second.desc.userData : nullptr;
-        impl_->contacts.push_back(event);
+        CollisionBus().Publish(event);
     }
     impl_->prevPairs.swap(currentPairs);
 }
@@ -359,7 +359,7 @@ RayHit NudgeWorld::Raycast(const Vec3& origin, const Vec3& direction, float maxD
 
 std::vector<ContactEvent> NudgeWorld::DrainContacts() {
     std::vector<ContactEvent> out;
-    out.swap(impl_->contacts);
+    CollisionBus().Drain(out);
     return out;
 }
 

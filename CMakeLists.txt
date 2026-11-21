@@ -39,6 +39,7 @@ add_library(rush-engine STATIC
     src/physics/qu3e_impl.cpp
     src/physics/nudge_impl.cpp
     src/physics/vehicle_impl.cpp
+    src/physics/collision_bus.cpp
     src/render/null_impl.cpp
 )
 target_sources(rush-engine PUBLIC
@@ -47,6 +48,7 @@ target_sources(rush-engine PUBLIC
         modules/core.cppm
         modules/physics.cppm
         modules/render.cppm
+        modules/events.cppm
 )
 
 add_library(rush::engine ALIAS rush-engine)

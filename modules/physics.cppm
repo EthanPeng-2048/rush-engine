@@ -11,6 +11,7 @@ export module rush.engine.physics;
 
 import rush.engine.core;
 import rush.engine.render;
+import rush.engine.events;
 
 export namespace apex {
 
@@ -193,6 +194,11 @@ private:
 };
 
 
+
+
+// Collision event bus: physics Step Publish()es contact events here; the
+// game layer Drain()es on its own stage (never from inside Step).
+rush::EventBus<ContactEvent>& CollisionBus();
 
 // --- Vehicle dynamics (P2: moved from game layer) ---
 
