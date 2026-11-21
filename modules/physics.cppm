@@ -1,4 +1,4 @@
-﻿module;
+module;
 #include <array>
 #include <string>
 #include <cstdint>
@@ -437,6 +437,7 @@ struct VehicleState {
     float rearDownforce = 0.f;
     float dragForce = 0.f;
     float damageTotal = 0.f;
+    float wheelSpin = 0.f;  // visual wheel rotation [rad]
 };
 
 struct VehicleInput {
@@ -485,6 +486,11 @@ public:
     }
 
     void Render(IRenderer& renderer, const Color& tint) const;
+    // Snapshot-friendly draw: no IPhysicsWorld access — used by the async
+    // render stage from a published VehicleState + chassis transform.
+    static void RenderPose(IRenderer& renderer, const Transform& chassis,
+                           const VehicleState& state, const VehicleParams& params,
+                           const Color& tint);
 
 private:
     void UpdatePowertrain(const VehicleInput& input, float dt);

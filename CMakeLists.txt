@@ -51,6 +51,7 @@ target_sources(rush-engine PUBLIC
         modules/render.cppm
         modules/events.cppm
         modules/job.cppm
+        modules/runtime.cppm
 )
 
 add_library(rush::engine ALIAS rush-engine)

@@ -467,6 +467,7 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     state_.throttle = throttleSmooth_;
     state_.brake = brakeSmooth_;
     state_.steerAngleDeg = steerAngle_ * kRadToDeg;
+    state_.wheelSpin = wheelSpinAngle_;
 
     float damageSum = 0.f;
     for (int i = 0; i < static_cast<int>(CarPart::Count); ++i) damageSum += state_.partHealth[i];
@@ -837,20 +838,26 @@ void Vehicle::UpdateDamageFromContact(const ContactEvent& event) {
 void Vehicle::Render(IRenderer& renderer, const Color& tint) const {
     if (!world_ || chassis_ == kInvalidBody) return;
     const Transform transform = world_->GetTransform(chassis_);
+    RenderPose(renderer, transform, state_, params_, tint);
+}
+
+void Vehicle::RenderPose(IRenderer& renderer, const Transform& transform,
+                         const VehicleState& state, const VehicleParams& params,
+                         const Color& tint) {
     EnsureModel(renderer);
     const ModelCache& cache = GetModelCache();
 
     // Body: rigidly attached to the chassis, its ground plane at the wheel
     // contact (static ride height below the chassis origin).
     Transform bodyT = transform;
-    bodyT.position += TransformDirection(transform, Vec3{0.f, -(kStaticSuspension + params_.wheelRadius), 0.f});
+    bodyT.position += TransformDirection(transform, Vec3{0.f, -(kStaticSuspension + params.wheelRadius), 0.f});
 
     // Simple quality-option shadow: the body footprint squashed onto the
     // ground under the wheels.
     if (renderer.ShadowsEnabled()) {
         bool grounded = false;
         float groundY = 0.f;
-        for (const WheelState& wheel : state_.wheels) {
+        for (const WheelState& wheel : state.wheels) {
             if (!wheel.grounded) continue;
             if (!grounded || wheel.contactPoint.y < groundY) groundY = wheel.contactPoint.y;
             grounded = true;
@@ -865,21 +872,20 @@ void Vehicle::Render(IRenderer& renderer, const Color& tint) const {
     // Wheels follow the suspension in Y, steer around up (front) and spin
     // around their axle. Anchor X/Z come from the model so the wheels stay in
     // the arches; Y comes from the live raycast suspension length.
+    const float steerRad = state.steerAngleDeg * kDegToRad;
     for (const WheelDraw& draw : kWheelDraws) {
-        const WheelState& wheel = state_.wheels[draw.wheelIndex];
+        const WheelState& wheel = state.wheels[draw.wheelIndex];
         const float suspLen = wheel.grounded ? wheel.suspensionLength : kStaticSuspension;
 
         Quat rot = transform.rotation;
         if (IsFront(draw.wheelIndex)) {
-            rot = rot * Quat::FromAxisAngle(Vec3{0.f, 1.f, 0.f}, steerAngle_);
+            rot = rot * Quat::FromAxisAngle(Vec3{0.f, 1.f, 0.f}, steerRad);
         }
-        rot = rot * Quat::FromAxisAngle(Vec3{1.f, 0.f, 0.f}, wheelSpinAngle_);
+        rot = rot * Quat::FromAxisAngle(Vec3{1.f, 0.f, 0.f}, state.wheelSpin);
 
         Transform t;
         t.position = TransformPoint(transform, Vec3{draw.anchorX, -suspLen, draw.anchorZ});
         t.rotation = rot;
-        // Wheels carry the livery bake too (tire dark / rim light), so the
-        // tint is a mid gray instead of near black.
         const float wearTint = 1.f - wheel.wear * 0.45f;
         renderer.DrawMesh(cache.wheel, t, Color{0.45f, 0.45f, 0.48f, wearTint});
     }
