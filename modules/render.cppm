@@ -1,0 +1,257 @@
+﻿module;
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+export module rush.engine.render;
+
+import rush.engine.core;
+
+export namespace apex {
+
+
+struct Vec2f {
+    float x = 0.f, y = 0.f;
+};
+
+struct Color {
+    float r = 1.f, g = 1.f, b = 1.f, a = 1.f;
+
+    static Color White() { return {1.f, 1.f, 1.f, 1.f}; }
+    static Color Black() { return {0.f, 0.f, 0.f, 1.f}; }
+    static Color Red() { return {1.f, 0.2f, 0.2f, 1.f}; }
+    static Color Green() { return {0.2f, 1.f, 0.3f, 1.f}; }
+    static Color Blue() { return {0.25f, 0.5f, 1.f, 1.f}; }
+    static Color Yellow() { return {1.f, 0.9f, 0.2f, 1.f}; }
+    static Color Gray() { return {0.55f, 0.55f, 0.58f, 1.f}; }
+    static Color DarkGray() { return {0.22f, 0.22f, 0.25f, 1.f}; }
+    static Color Orange() { return {1.f, 0.55f, 0.15f, 1.f}; }
+};
+
+struct CameraDesc {
+    Vec3 position{0.f, 5.f, -10.f};
+    Vec3 target{0.f, 0.f, 0.f};
+    Vec3 up{0.f, 1.f, 0.f};
+    float fovYDeg = 65.f;
+};
+
+// Video settings applied at runtime from the settings menu. Backends
+// implement what they support and ignore the rest (headless = everything).
+struct VideoConfig {
+    bool borderlessFullscreen = false;
+    int width = 1280;
+    int height = 720;
+    int fpsLimit = 0;       // 0 = uncapped
+    bool shadows = true;    // quality: simple ground shadows
+};
+
+// Triangle mesh in engine-agnostic form. Winding is counter-clockwise.
+struct MeshData {
+    std::vector<Vec3> positions;
+    std::vector<Vec3> normals;
+    std::vector<float> uvs;              // 2 floats per vertex
+    std::vector<uint8_t> colors;         // optional RGBA bytes per vertex
+    std::vector<uint32_t> indices;
+};
+
+using MeshHandle = uint32_t;
+constexpr MeshHandle kInvalidMesh = 0;
+
+// Unified render interface. The game layer only talks to this, so the
+// backend (raylib today, something else later) is replaceable.
+class IRenderer {
+public:
+    virtual ~IRenderer() = default;
+
+    virtual bool Init(int width, int height, const std::string& title) = 0;
+    virtual void Shutdown() = 0;
+
+    virtual bool ShouldClose() const = 0;
+    // Frame lifecycle: BeginFrame/Clear -> BeginScene/EndScene (3D) ->
+    // 2D overlay calls -> EndFrame.
+    virtual void BeginFrame() = 0;
+    virtual void BeginScene() = 0;
+    virtual void EndScene() = 0;
+    virtual void EndFrame() = 0;
+
+    virtual void SetCamera(const CameraDesc& camera) = 0;
+    virtual int ScreenWidth() const = 0;
+    virtual int ScreenHeight() const = 0;
+
+    virtual void ApplyVideo(const VideoConfig& video) = 0;
+    virtual bool ShadowsEnabled() const = 0;
+
+    virtual MeshHandle CreateMesh(const MeshData& data) = 0;
+    virtual void DestroyMesh(MeshHandle handle) = 0;
+    virtual void DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint) = 0;
+    // Cheap quality-option shadow: squashes the mesh onto the ground plane at
+    // groundY (top-down footprint) and draws it translucent dark.
+    virtual void DrawMeshShadow(MeshHandle handle, const Transform& transform, float groundY,
+                                const Color& tint) = 0;
+
+    // Immediate primitives for debugging, HUD and low-poly bodies.
+    virtual void DrawBox(const Vec3& halfExtents, const Transform& transform, const Color& color) = 0;
+    virtual void DrawLine3D(const Vec3& start, const Vec3& end, const Color& color) = 0;
+    virtual void DrawGrid(int slices, float spacing) = 0;
+
+    virtual void DrawRect2D(float x, float y, float w, float h, const Color& color) = 0;
+    virtual void DrawText2D(const std::string& text, float x, float y, int size, const Color& color) = 0;
+    virtual Vec2f MeasureText2D(const std::string& text, int size) const = 0;
+
+    virtual double TimeSeconds() const = 0;
+    virtual float FrameTime() const = 0;
+    virtual void CaptureScreenshot(const std::string& path) = 0;
+};
+
+// Input state sampled once per frame. Kept separate from IRenderer so a
+// dedicated input backend can replace it without touching rendering.
+struct InputState {
+    float throttle = 0.f;      // 0..1
+    float brake = 0.f;         // 0..1
+    // -1..1, positive = steer right (D / right arrow must give +1). The
+    // vehicle frame is +Z forward / +Y up (right handed), whose geometric
+    // right side is -X, so "right" is a negative yaw — conversions live in
+    // Vehicle::Update, input backends only map keys to this semantic.
+    float steer = 0.f;
+    bool handbrake = false;
+    bool reverse = false;
+    bool drsToggle = false;
+    bool wingModeToggle = false;
+    bool overtake = false;
+    bool cameraCycle = false;
+    bool pause = false;
+    bool restart = false;
+    bool lookBack = false;
+
+    // Menu navigation (edge-triggered). Shared with W/S/A/D and arrows so the
+    // menu works without a mouse; only consumed in Menu/Settings phases.
+    bool menuUp = false;
+    bool menuDown = false;
+    bool menuLeft = false;
+    bool menuRight = false;
+    bool menuSelect = false;
+    bool menuBack = false;
+};
+
+class IInput {
+public:
+    virtual ~IInput() = default;
+    virtual InputState Poll() = 0;
+};
+
+
+
+
+// Headless renderer + scripted input. Implements the same unified interfaces
+// as RaylibBackend with no window, so the game logic (physics, race rules,
+// AI) can run in automated tests and on machines without a display. Doubles
+// as proof that the render/input layer is replaceable.
+class NullBackend final : public IRenderer, public IInput {
+public:
+    // Returned verbatim by Poll(); tests set this to drive the player car.
+    InputState scripted;
+
+    // Fixed timestep reported by FrameTime(); physics runs deterministically.
+    float frameDt = 1.f / 60.f;
+
+    // IRenderer -----------------------------------------------------------
+    bool Init(int width, int height, const std::string& title) override;
+    void Shutdown() override;
+    bool ShouldClose() const override;
+    void BeginFrame() override;
+    void BeginScene() override;
+    void EndScene() override;
+    void EndFrame() override;
+    void SetCamera(const CameraDesc& camera) override;
+    int ScreenWidth() const override;
+    int ScreenHeight() const override;
+    void ApplyVideo(const VideoConfig& video) override;
+    bool ShadowsEnabled() const override;
+    MeshHandle CreateMesh(const MeshData& data) override;
+    void DestroyMesh(MeshHandle handle) override;
+    void DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint) override;
+    void DrawMeshShadow(MeshHandle handle, const Transform& transform, float groundY,
+                        const Color& tint) override;
+    void DrawBox(const Vec3& halfExtents, const Transform& transform, const Color& color) override;
+    void DrawLine3D(const Vec3& start, const Vec3& end, const Color& color) override;
+    void DrawGrid(int slices, float spacing) override;
+    void DrawRect2D(float x, float y, float w, float h, const Color& color) override;
+    void DrawText2D(const std::string& text, float x, float y, int size, const Color& color) override;
+    Vec2f MeasureText2D(const std::string& text, int size) const override;
+    double TimeSeconds() const override;
+    float FrameTime() const override;
+    void CaptureScreenshot(const std::string& path) override;
+
+    // IInput --------------------------------------------------------------
+    InputState Poll() override;
+
+    // Debug capture: record DrawMesh calls so the composed scene can be
+    // exported (DumpObj) and inspected without a GPU/window.
+    bool captureDraws = false;
+    void DumpObj(const std::string& path) const;
+
+private:
+    struct DrawCmd {
+        MeshHandle mesh = kInvalidMesh;
+        Transform transform;
+        Color tint;
+    };
+
+    int width_ = 1280;
+    int height_ = 720;
+    VideoConfig video_;
+    double time_ = 0.0;
+    MeshHandle nextMesh_ = 1;
+    std::unordered_map<MeshHandle, MeshData> meshes_;
+    std::vector<DrawCmd> draws_;
+    bool closeRequested_ = false;
+};
+
+
+
+
+// Raylib implementation of the unified render/input interfaces. All raylib
+// types stay inside this class so the game layer never sees them.
+class RaylibBackend final : public IRenderer, public IInput {
+public:
+    ~RaylibBackend() override;
+
+    // IRenderer
+    bool Init(int width, int height, const std::string& title) override;
+    void Shutdown() override;
+    bool ShouldClose() const override;
+    void BeginFrame() override;
+    void BeginScene() override;
+    void EndScene() override;
+    void EndFrame() override;
+    void SetCamera(const CameraDesc& camera) override;
+    int ScreenWidth() const override;
+    int ScreenHeight() const override;
+    void ApplyVideo(const VideoConfig& video) override;
+    bool ShadowsEnabled() const override;
+    MeshHandle CreateMesh(const MeshData& data) override;
+    void DestroyMesh(MeshHandle handle) override;
+    void DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint) override;
+    void DrawMeshShadow(MeshHandle handle, const Transform& transform, float groundY,
+                        const Color& tint) override;
+    void DrawBox(const Vec3& halfExtents, const Transform& transform, const Color& color) override;
+    void DrawLine3D(const Vec3& start, const Vec3& end, const Color& color) override;
+    void DrawGrid(int slices, float spacing) override;
+    void DrawRect2D(float x, float y, float w, float h, const Color& color) override;
+    void DrawText2D(const std::string& text, float x, float y, int size, const Color& color) override;
+    Vec2f MeasureText2D(const std::string& text, int size) const override;
+    double TimeSeconds() const override;
+    float FrameTime() const override;
+    void CaptureScreenshot(const std::string& path) override;
+
+    // IInput
+    InputState Poll() override;
+
+private:
+    struct Impl;
+    Impl* impl_ = nullptr;
+};
+
+
+}  // namespace apex

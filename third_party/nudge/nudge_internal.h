@@ -1,0 +1,808 @@
+// nudge_internal.h -- internal types for nudge physics engine (unity build)
+#ifndef NUDGE_INTERNAL_H
+#define NUDGE_INTERNAL_H
+
+// Force FP contraction off TU-wide. Repeated from vmath.h because Clang's
+// pragma scoping across included files has been observed to drop the state
+// on some build paths. Emitting the pragma again at the top of the engine's
+// main internal header guarantees every .c file included after this is
+// parsed with contraction disabled.
+#ifdef __clang__
+#pragma clang fp contract(off)
+#endif
+#ifndef __cplusplus
+#pragma STDC FP_CONTRACT OFF
+#endif
+
+// Internal constant: feature ID bit flag for edge-edge contacts.
+// Edge contacts: edge_a | (edge_b << 16) | FEATURE_EDGE_BIT
+#define FEATURE_EDGE_BIT 0x80000000u
+
+// Portable float validity: rejects NaN, inf, and extreme magnitudes.
+// NaN fails the self-equality test; inf and huge values fail the bound test.
+static inline int float_valid(float f) { return f == f && f > -1e18f && f < 1e18f; }
+static inline int v3_is_valid(v3 v) { return float_valid(v.x) && float_valid(v.y) && float_valid(v.z); }
+static inline int quat_is_valid(quat q) { return float_valid(q.x) && float_valid(q.y) && float_valid(q.z) && float_valid(q.w); }
+#define is_valid(x) _Generic((x), float: float_valid, v3: v3_is_valid, quat: quat_is_valid)(x)
+
+// Per-body contact listener entry. Stored in WorldInternal.body_listeners,
+// keyed by body index. Behavior lives in contacts.c.
+typedef struct BodyListener
+{
+	BodyContactListener fn;
+	void* ud;
+} BodyListener;
+
+// -----------------------------------------------------------------------------
+// Internal types: cold (metadata) and hot (solver iteration) splits.
+
+typedef struct ShapeInternal
+{
+	ShapeType type;
+	v3 local_pos;
+	quat local_rot;   // rotation in body local frame (always valid; body_add_shape normalises)
+	float rounding_radius; // convex rounding applied to box/hull (0 otherwise)
+	float r_min;      // inscribed-sphere radius about the shape's local origin (includes rounding_radius)
+	float r_max;      // bounding-sphere radius about the shape's local origin (includes rounding_radius)
+	union {
+		struct { float radius; } sphere;
+		struct { float half_height; float radius; } capsule;
+		struct { v3 half_extents; } box;
+		struct { const Hull* hull; v3 scale; } hull;
+		struct { const TriMesh* mesh; } mesh;
+		struct { const Heightfield* hf; } heightfield;
+	};
+} ShapeInternal;
+
+// Cold: persistent metadata, topology, rarely touched during solve.
+typedef struct SensorInternal
+{
+	v3 position;
+	quat rotation;
+	uint32_t collision_group;
+	uint32_t collision_mask;
+	CK_DYNA ShapeInternal* shapes;
+} SensorInternal;
+
+typedef struct BodyCold
+{
+	float mass;
+	CK_DYNA ShapeInternal* shapes;
+	int bvh_leaf;     // -1 if not in BVH
+	int island_id;    // -1 = no island (static or unconnected)
+	int island_prev;  // prev body in island body list, -1 = head
+	int island_next;  // next body in island body list, -1 = tail
+	// Collision filter (Bullet/Jolt convention). Two bodies collide iff
+	//   (a.group & b.mask) && (b.group & a.mask).
+	// Default both to 0xFFFFFFFF so new bodies collide with everything.
+	uint32_t collision_group;
+	uint32_t collision_mask;
+
+	// Compound/instance id. Bodies sharing a non-zero compound_id never
+	// collide with each other -- the cheap fast-path for ragdolls, vehicles,
+	// and articulated chains where every part of one instance must phase
+	// through every other part of the same instance, but instances of the
+	// same class still collide with each other and with the world. Default 0
+	// = no compound (collisions follow group/mask only).
+	uint32_t compound_id;
+	// Default material id for this body. Reported in ContactSummary.material_a/b
+	// for non-mesh sides. Mesh sides prefer per-triangle ids when set.
+	uint8_t material_id;
+	// CCD speed-test bounds (Catto GDC 2025). r_min is the largest sphere
+	// centered at body origin that fits inside every shape; r_max is the
+	// smallest sphere centered at body origin that contains every shape.
+	// Skipped for bodies containing only static shapes (mesh/heightfield).
+	// Recomputed in body_add_shape. Zero when no valid shapes are present.
+	float r_min_body;
+	float r_max_body;
+} BodyCold;
+
+// Hot: solver working set, iterated every PGS step, packed for cache.
+// Layout matches old SolverBodyVel so the SIMD gather/scatter macros work directly.
+typedef struct BodyHot
+{
+	v3 velocity;
+	v3 angular_velocity;
+	v3 iw_diag;           // precomputed world-space inverse inertia (xx,yy,zz)
+	v3 iw_off;            // precomputed world-space inverse inertia (xy,xz,yz)
+	float inv_mass;
+	float _pad[3];
+} BodyHot;
+
+// State: per-body data needed outside the inner PGS loop (integration, collision,
+// joint geometry, sleep bookkeeping). Parallel array indexed the same as body_hot.
+typedef struct BodyState
+{
+	v3 position;
+	quat rotation;
+	v3 inv_inertia_local; // diagonal of local-space inverse inertia tensor
+	float friction;
+	float rolling_friction;
+	float restitution;
+	float linear_damping;
+	float angular_damping;
+	float sleep_time;     // accumulated seconds below velocity threshold
+	int sleep_allowed;    // 1 = can sleep (default), 0 = never sleep
+} BodyState;
+
+// Body field accessors: decouple call sites from tier assignment.
+// Moving a field between BodyHot/BodyState = change one macro, not 50 files.
+#define body_pos(w, i)              (w)->body_state[i].position
+#define body_rot(w, i)              (w)->body_state[i].rotation
+#define body_vel(w, i)              (w)->body_hot[i].velocity
+#define body_angvel(w, i)           (w)->body_hot[i].angular_velocity
+#define body_inv_mass(w, i)         (w)->body_hot[i].inv_mass
+#define body_iw_diag(w, i)          (w)->body_hot[i].iw_diag
+#define body_iw_off(w, i)           (w)->body_hot[i].iw_off
+#define body_inv_inertia_local(w, i) (w)->body_state[i].inv_inertia_local
+#define body_friction(w, i)         (w)->body_state[i].friction
+#define body_restitution(w, i)      (w)->body_state[i].restitution
+#define body_lin_damping(w, i)      (w)->body_state[i].linear_damping
+#define body_ang_damping(w, i)      (w)->body_state[i].angular_damping
+#define body_sleep_time(w, i)       (w)->body_state[i].sleep_time
+#define body_sleep_allowed(w, i)    (w)->body_state[i].sleep_allowed
+
+// Scalar body reference: bundles pointers to both tiers from a single index lookup.
+// Prevents mismatched indices (body_hot[a] with body_state[b]).
+// Usage: BodyRef r = body_ref(w, idx); r.hot->velocity; r.state->position;
+typedef struct BodyRef { BodyHot* hot; BodyState* state; } BodyRef;
+#define body_ref(w, i) ((BodyRef){ &(w)->body_hot[i], &(w)->body_state[i] })
+
+// Number of ShapeType enumerators. Keep in sync with ShapeType in nudge.h.
+// Used to size the narrowphase dispatch table.
+#define SHAPE_TYPE_COUNT 6
+
+// Cached narrowphase feature pair for incremental manifold refresh.
+// type=0: cold (no cache), type=1: face-face, type=2: edge-edge.
+typedef struct CachedFeaturePair
+{
+	int16_t type;      // 0=cold, 1=face-face, 2=edge-edge
+	int16_t ref_body;  // 0=A is reference, 1=B is reference
+	int16_t face_a;    // face index on hull A (or box face 0-5)
+	int16_t face_b;    // face index on hull B
+	int16_t edge_a;    // half-edge index (edge-edge only)
+	int16_t edge_b;    // half-edge index (edge-edge only)
+} CachedFeaturePair;
+
+typedef struct WarmManifold WarmManifold; // forward decl for warm cache
+
+// Narrowphase dispatch context. One ctx per pair, populated by narrowphase_pair
+// (body indices, canonicalised shape pointers, warm-cache hint slots). Agents
+// fill m_out on hit and may write sat_hint / out_pair (hull-involved pairs).
+typedef struct NarrowphaseCtx
+{
+	struct WorldInternal* w;
+	int body_a, body_b;        // canonical: shape_a->type <= shape_b->type
+	ShapeInternal* shape_a;
+	ShapeInternal* shape_b;
+	BodyState* bs_a;
+	BodyState* bs_b;
+	int* sat_hint;             // may be NULL; hill-climb warm start for SAT
+	CachedFeaturePair* out_pair; // may be NULL; agent writes cached feature pair
+	Manifold* m_out;           // hit: agent fills this
+} NarrowphaseCtx;
+
+typedef int (*NarrowphaseAgent)(NarrowphaseCtx*);
+
+// Joint persistent storage (handle-based, parallel arrays like bodies).
+typedef enum JointType {
+	JOINT_BALL_SOCKET, JOINT_DISTANCE, JOINT_HINGE, JOINT_FIXED, JOINT_PRISMATIC,
+	JOINT_ANGULAR_MOTOR, JOINT_TWIST_LIMIT, JOINT_CONE_LIMIT, JOINT_SWING_TWIST
+} JointType;
+
+typedef struct JointInternal
+{
+	JointType type;
+	int body_a, body_b; // array indices (resolved from handles at creation)
+	union {
+		struct { v3 local_a, local_b; SpringParams spring; } ball_socket;
+		struct { v3 local_a, local_b; float rest_length; SpringParams spring; float limit_min, limit_max; } distance;
+		struct { v3 local_a, local_b; v3 local_axis_a, local_axis_b; v3 local_ref_a, local_ref_b; SpringParams spring; float limit_min, limit_max; float motor_speed, motor_max_impulse; } hinge;
+		struct { v3 local_a, local_b; quat local_rel_quat; SpringParams spring; } fixed;
+		struct { v3 local_a, local_b; v3 local_axis_a, local_axis_b; quat local_rel_quat; SpringParams spring; float motor_speed, motor_max_impulse; } prismatic;
+		struct { v3 local_axis_a, local_axis_b; float target_speed, max_impulse; } angular_motor;
+		struct { v3 local_axis_a, local_axis_b; float limit_min, limit_max; SpringParams spring; } twist_limit;
+		struct { v3 local_axis_a, local_axis_b; float half_angle; SpringParams spring; } cone_limit;
+		struct { v3 local_a, local_b; v3 local_axis_a, local_axis_b; float cone_half_angle, twist_min, twist_max; SpringParams spring; } swing_twist;
+	};
+	// Island linked list fields.
+	int island_id;    // -1 = none
+	int island_prev;  // -1 = head
+	int island_next;  // -1 = tail
+} JointInternal;
+
+// Hot joint data touched every substep by pre/post-solve warm starting.
+// Parallel array with JointInternal (indexed by joint handle's index).
+typedef struct JointHot
+{
+	float warm_lambda[6];
+} JointHot;
+
+// True when a joint has any bounded DOF (limit, motor, or always-bounded type).
+// Such joints are solved entirely in PGS so all DOFs stay coupled; LDL skips them.
+static inline int joint_internal_has_limits(const JointInternal* j)
+{
+	switch (j->type) {
+	case JOINT_BALL_SOCKET:
+	case JOINT_FIXED:
+		return 0;
+	case JOINT_DISTANCE:
+		return j->distance.limit_min > 0.0f || j->distance.limit_max > 0.0f;
+	case JOINT_HINGE:
+		return j->hinge.limit_min != 0.0f || j->hinge.limit_max != 0.0f || j->hinge.motor_max_impulse > 0.0f;
+	case JOINT_PRISMATIC:
+		return j->prismatic.motor_max_impulse > 0.0f;
+	case JOINT_ANGULAR_MOTOR:
+	case JOINT_TWIST_LIMIT:
+	case JOINT_CONE_LIMIT:
+	case JOINT_SWING_TWIST:
+		return 1;
+	}
+	return 0;
+}
+
+typedef struct BVH_Tree BVH_Tree; // forward decl, defined in bvh.c
+
+// LDL direct solver types (used by solver_ldl.c).
+// Per-DOF Jacobian row: J_a and J_b each have 6 components [lin_x, lin_y, lin_z, ang_x, ang_y, ang_z].
+// LDL computes K = J * M^{-1} * J^T, RHS = -J * v, and impulse = M^{-1} * J^T * lambda generically.
+typedef struct LDL_JacobianRow
+{
+	double J_a[6];
+	double J_b[6];
+} LDL_JacobianRow;
+
+typedef struct LDL_Constraint
+{
+	int type;         // JOINT_BALL_SOCKET, JOINT_DISTANCE, or JOINT_HINGE (or -1 for synthetic)
+	int dof;          // 3 or 1
+	int body_a, body_b;         // body indices (may be virtual shard indices for graph topology)
+	int real_body_a, real_body_b; // always real body indices (for physics data lookup)
+	double weight_a, weight_b;   // shard weight (1.0 = normal, S = shattered into S shards)
+	int solver_idx;   // index into sol_bs[] or sol_dist[] (-1 for synthetic)
+	int is_synthetic;
+	int bundle_idx;   // which bundle this constraint belongs to
+	int bundle_offset; // local DOF offset within its bundle's DOF space
+	int jacobian_start; // index into LDL_Cache.jacobians[] for first row
+} LDL_Constraint;
+
+// Group of constraints between the same body pair, forming one graph node.
+typedef struct LDL_Bundle
+{
+	int body_a, body_b;     // body pair
+	int dof;                // total DOF (sum of constituent constraints)
+	int start, count;       // range into LDL_Cache.constraints[]
+} LDL_Bundle;
+
+// Sparse block matrix: adjacency-list format per constraint node.
+// Each node i has a diagonal block (dof[i] x dof[i]) and off-diagonal
+// blocks to its neighbors. Stored as flat float arrays.
+#define LDL_MAX_NODES 128
+#define LDL_MAX_BLOCK_DIM 12  // max DOF per bundle (12*13/2 = 78 packed elements)
+
+typedef struct LDL_Sparse
+{
+	int node_count;
+	int dof[LDL_MAX_NODES];          // DOF per node
+	int row_offset[LDL_MAX_NODES+1]; // cumulative DOF offset
+	int n;                            // total scalar DOFs
+
+	// Diagonal blocks: packed lower-triangular, dof*(dof+1)/2 doubles per node.
+	double diag_data[LDL_MAX_NODES][78]; // max 12x12 packed (78 elements)
+	double diag_D[LDL_MAX_NODES][12];   // D pivots from block LDL (max 12 per block)
+
+	// Off-diagonal: per-node neighbor list.
+	// adj[i][k] = neighbor node index, adj_data[i][k] = block data (dof[i]*dof[j] doubles).
+	CK_DYNA int* adj[LDL_MAX_NODES];       // neighbor indices
+	CK_DYNA double* adj_data[LDL_MAX_NODES]; // packed block doubles per neighbor
+
+	// Elimination ordering (symbolic phase output).
+	int elim_order[LDL_MAX_NODES]; // pivot sequence
+	int inv_order[LDL_MAX_NODES];  // inv_order[node] = elimination step
+} LDL_Sparse;
+
+// Precomputed neighbor for forward/back substitution in solve phase.
+typedef struct LDL_Neighbor
+{
+	int node;       // neighbor node index
+	int dn;         // neighbor DOF
+	int on;         // neighbor row_offset
+	int L_offset;   // offset into L_factors for the L block
+} LDL_Neighbor;
+
+// Schur complement update during numeric factorization.
+typedef struct LDL_Schur
+{
+	int i, j;           // target nodes being updated
+	int Lik_offset;     // L_factors offset for L_{i,k}
+	int Ljk_offset;     // L_factors offset for L_{j,k}
+	int target_offset;  // L_factors offset for target edge (i,j) (-1 = diagonal)
+	int target_offset_rev; // L_factors offset for reverse edge (j,i) (-1 if diagonal or same)
+	int target_node;    // diagonal node index when target_offset == -1
+	int di, dk, dj;     // block dimensions
+} LDL_Schur;
+
+// Non-eliminated neighbor for L-block computation during factorization.
+typedef struct LDL_Column
+{
+	int node;       // non-eliminated neighbor
+	int dn;         // its DOF
+	int L_offset;   // where to write L_{node,pivot} in L_factors
+} LDL_Column;
+
+// Per-pivot precomputed index ranges.
+typedef struct LDL_Pivot
+{
+	int node, dk, ok;             // node index, DOF, row_offset
+	int fwd_start, fwd_count;     // forward-sub neighbors (eliminated before)
+	int back_start, back_count;   // back-sub neighbors (eliminated after)
+	int col_start, col_count;     // L-column entries for factorization
+	int schur_start, schur_count; // Schur complement updates for this pivot
+} LDL_Pivot;
+
+// K-edge fill instruction: maps shared body to off-diagonal L_factors offsets.
+typedef struct LDL_Coupling
+{
+	int body;                     // shared body index (real or virtual)
+	int block_i, block_j;         // constraint node indices
+	int L_offset_ij, L_offset_ji; // L_factors offsets for both directions
+} LDL_Coupling;
+
+// Cached constraint system topology: computed once per topology change,
+// reused across substeps. Stores elimination ordering, sparsity pattern,
+// and precomputed memory offsets into L_factors.
+typedef struct LDL_Topology
+{
+	int node_count, n;
+	int dof[LDL_MAX_NODES];
+	int row_offset[LDL_MAX_NODES + 1];
+	int elim_order[LDL_MAX_NODES];
+	int inv_order[LDL_MAX_NODES];
+	LDL_Pivot pivots[LDL_MAX_NODES];
+	CK_DYNA LDL_Neighbor* fwd_neighbors;
+	CK_DYNA LDL_Neighbor* back_neighbors;
+	CK_DYNA LDL_Column* columns;
+	CK_DYNA LDL_Schur* schurs;
+	CK_DYNA LDL_Coupling* couplings;
+	int L_factors_size; // total floats in L_factors
+} LDL_Topology;
+
+typedef struct LDL_Cache
+{
+	CK_DYNA LDL_Constraint* constraints;
+	int joint_count;
+	CK_DYNA LDL_Bundle* bundles;
+	int bundle_count;
+	int n;              // total DOFs
+	LDL_Topology* topo; // cached topology (NULL until built)
+	CK_DYNA double* L_factors; // contiguous off-diagonal L-factor blocks (double precision)
+	CK_DYNA LDL_JacobianRow* jacobians;  // per-DOF Jacobian rows (filled each substep)
+	double diag_data[LDL_MAX_NODES][78]; // diagonal blocks: packed lower-triangular (max 12x12 = 78)
+	double diag_D[LDL_MAX_NODES][12];    // D pivots (max 12 per block)
+	int topo_version;   // world topo version when blocks were built
+
+	// Preallocated solve scratch buffers (sized to n DOFs, reused across substeps)
+	CK_DYNA double* solve_rhs;
+	CK_DYNA double* solve_lambda;
+
+	// Shattering state (weight-based: no virtual body copies)
+	int virtual_body_count;          // count of virtual shard indices (for graph topology)
+	CK_DYNA int* body_remap;         // real_body_idx -> first virtual shard index (-1 if not shattered)
+	CK_DYNA int* shard_counts;       // real_body_idx -> number of shards (0 if not shattered)
+} LDL_Cache;
+
+// Island: group of connected bodies that can sleep/wake together.
+typedef struct Island
+{
+	int head_body, tail_body, body_count;
+	int head_joint, tail_joint, joint_count;
+	int constraint_remove_count;
+	int awake; // 1 = awake, 0 = sleeping
+	LDL_Cache ldl;
+} Island;
+
+#define SLEEP_VEL_THRESHOLD   0.01f  // squared velocity magnitude threshold
+#define SLEEP_TIME_THRESHOLD  0.5f   // seconds of stillness before sleep
+#define LINEAR_SLOP           0.01f  // contact margin: keeps contacts alive near zero-penetration
+
+// Speculative contact margin. When WorldInternal.speculative_enabled is 1,
+// narrowphase emits contacts with signed separation in
+// [-penetration_tol, +speculative_margin] instead of only on penetration.
+// The solver (pre_solve_manifold.inc) then drives a velocity bias that
+// prevents the gap from closing within the step.
+// Invariant: speculative_margin >= LINEAR_SLOP (required by the speed-test
+// correctness guarantee in toi.c).
+#define NUDGE_SPECULATIVE_MARGIN 0.05f
+
+// Narrowphase debug snapshot: intermediate SAT state + final contact output
+// for one pair. Written by collision.c narrowphase routines when the world's
+// np_debug_enabled flag is set and the pair matches the configured filter.
+// The remote viewer reads this via RPM (`get np_debug`) so SAT intermediates
+// that would otherwise be function locals become inspectable without cdb.
+// Single slot -- stomped under parallel narrowphase; force threads=1 when
+// inspecting. Intended usage:
+//   WorldInternal* wi = ...;
+//   wi->np_debug_enabled = 1;
+//   wi->np_debug_filter_body_a = 42;   // or -1 for any
+//   wi->np_debug_filter_body_b = -1;
+//   // step or DBG_BREAK inside / after the narrowphase call
+//   // viewer: `get np_debug` -> full SAT + contact dump
+typedef struct NP_DebugSnapshot
+{
+	int valid;               // 1 after a successful capture, 0 otherwise
+	int frame;               // WorldInternal.frame at capture time
+	int body_a, body_b;      // real body indices in the pair
+	int shape_a_kind, shape_b_kind; // ShapeType enum values
+	// SAT (hull-hull) query results. For non-hull pairs these stay 0 / -1.
+	int face_a_index;
+	float face_a_sep;
+	int face_b_index;
+	float face_b_sep;
+	int edge_a_index;
+	int edge_b_index;
+	float edge_sep;
+	int winning_axis;        // 0=face_a, 1=face_b, 2=edge, -1=separated / no contact produced
+	// Contact output (shared by all narrowphase paths).
+	v3 contact_normal;
+	int contact_count;
+	v3 contact_points[4];
+	float contact_pens[4];
+} NP_DebugSnapshot;
+
+typedef struct WorldInternal
+{
+	int frame; // monotonically increasing frame counter
+	v3 gravity;
+	CK_DYNA BodyCold*    body_cold;
+	CK_DYNA BodyHot*     body_hot;
+	CK_DYNA BodyState*   body_state;
+	CK_DYNA uint32_t*    body_gen;
+	CK_DYNA int*         body_free;
+	CK_DYNA Contact*     debug_contacts;
+	CK_MAP(WarmManifold) warm_cache;
+	// Joints (hot/cold split: warm_lambda is touched every frame in pre/post solve;
+	// cold geometry in JointInternal is accessed only during joint_fill_rows).
+	CK_DYNA JointInternal* joints;       // cold: type, geometry, spring, island links
+	CK_DYNA JointHot*      joint_hot;    // hot: warm-start lambdas (parallel array)
+	CK_DYNA uint32_t*      joint_gen;
+	CK_DYNA int*           joint_free;
+	// Sensors: read-only compound-shape query volumes. Owned by the world so
+	// snapshot + rewind can persist them. Never participate in broadphase or
+	// solver -- only sensor_query reads them.
+	CK_DYNA SensorInternal* sensors;
+	CK_DYNA uint32_t*       sensor_gen;
+	CK_DYNA int*            sensor_free;
+
+	// Asset registries for snapshot save/load. Keys are sinterned names
+	// (cast to uint64), values are user-owned Hull* / TriMesh*.
+	CK_MAP(const Hull*)         hull_registry;
+	CK_MAP(const TriMesh*)      mesh_registry;
+	CK_MAP(const Heightfield*)  heightfield_registry;
+	// Broadphase
+	BroadphaseType broadphase_type;
+	BVH_Tree* bvh_static;
+	BVH_Tree* bvh_dynamic;
+	BVH_Tree* bvh_sleeping; // sleeping dynamic bodies (no refit, no SAP)
+	// Islands
+	CK_DYNA Island*     islands;
+	CK_DYNA uint32_t*   island_gen;
+	CK_DYNA int*        island_free;
+	CK_MAP(uint8_t)     prev_touching; // body_pair_key -> 1 for pairs touching last frame
+	CK_MAP(uint8_t)     joint_pairs;   // body_pair_key -> 1 for bodies connected by joints (skip collisions)
+	int joint_pairs_version;           // ldl_topo_version when joint_pairs was last built
+	int sleep_enabled;       // 1 = island sleep active (default)
+	int sat_hint_enabled;    // 1 = warm-cache SAT axis hints fed to narrowphase
+	int sat_hillclimb_enabled; // 1 = hill-climb face search for hulls (vs brute force)
+	int box_use_hull;          // 1 = route box-box through hull-hull path (debug)
+	int incremental_np_enabled; // 1 = incremental narrowphase (cached feature pair refresh)
+	int warm_start_enabled;    // 1 = warm-start contact impulses from cache
+	// CCD speculative contacts. When speculative_enabled == 1, narrowphase
+	// emits contacts at signed separation up to speculative_margin. Default
+	// off to preserve bit-identical behavior until the solver speculative
+	// bias branch is wired (CCD plan step 3).
+	int speculative_enabled;
+	float speculative_margin;
+	// Fast-body classification (CCD speed test). Populated each world_step
+	// with body indices that failed (|v|+r_max*|w|)*dt < r_min and therefore
+	// need TOI advancement. Consumed by the post-solve TOI pass (toi.c).
+	// Cleared + rebuilt each step; stable order matches enumeration order.
+	CK_DYNA int* fast_body_list;
+	// Pre-step pose snapshot for every body in fast_body_list (parallel array,
+	// same index). Captured before integration so TOI can sweep from the true
+	// start-of-step pose to the post-solve pose.
+	CK_DYNA v3*   fast_body_pre_pos;
+	CK_DYNA quat* fast_body_pre_rot;
+	int thread_count;        // 0 or 1 = single-threaded, >1 = parallel PGS solver
+	// Per-worker scratch arenas. Lazily sized to max(1, thread_count) on first
+	// step; reset at the start of each step; freed in destroy_world. Workers
+	// allocate solver-temp arrays from their own arena with no locking.
+	CK_DYNA Arena* worker_arenas;
+	void* np_pairs_out; // CK_DYNA BroadPair** — when set, broadphase outputs pairs here instead of running narrowphase
+	int ldl_enabled;         // 1 = LDL direct correction for joints (dual solvers only)
+	int ldl_topo_version;    // incremented on joint create/destroy
+	int ldl_correction_iter; // which PGS iter triggers LDL correction (-1 = after all PGS iters)
+	SolverType solver_type;
+	int velocity_iters;
+	int position_iters;
+	float contact_hertz;
+	float contact_damping_ratio;
+	float max_push_velocity;
+	int sub_steps;
+	PerfTimers perf;
+
+	// Debug: solver arrays from last world_step, kept alive for remote viewer.
+	// Freed at the start of the next world_step. Typed void* because SolverManifold
+	// and SolverContact are defined later in the unity build.
+	void *dbg_solver_manifolds; // CK_DYNA SolverManifold*
+	void *dbg_solver_contacts;  // CK_DYNA SolverContact*
+	void *dbg_solver_joints;    // CK_DYNA SolverJoint*
+
+	// Narrowphase debug snapshot (see NP_DebugSnapshot definition above
+	// WorldInternal). Written by collide_hull_hull_ex on the first pair
+	// that matches the filter after np_debug_enabled flips on. All writes
+	// gated by np_debug_enabled so this is zero-cost when off.
+	int np_debug_enabled;        // 1 = capture next matching pair
+	int np_debug_filter_body_a;  // -1 = any
+	int np_debug_filter_body_b;  // -1 = any (ignores ordering: (A,B) also matches filter set for (B,A))
+	NP_DebugSnapshot np_debug;
+
+	// Rewind ring buffer (NULL until world_rewind_init). Defined in rewind.c.
+	// Topology-mutating API calls (create/destroy body+joint+shape) flush it.
+	struct RewindBuffer* rewind;
+
+	// Contact summaries -- built once per world_step after narrowphase by
+	// contacts.c. One entry per touching body pair, sorted by (a.id, b.id)
+	// with canonical a.id < b.id. Per-body listeners fire immediately after.
+	CK_DYNA ContactSummary* contact_summaries;
+	// Per-body listener callbacks, keyed by body index. Cleared on destroy_body.
+	CK_MAP(BodyListener) body_listeners;
+	// Scratch buffer reused across listener fires each step (grown to the
+	// largest per-body contact count). Avoids per-listener malloc churn.
+	CK_DYNA ContactSummary* listener_scratch;
+	// Material palette. palette[0] defaults to {0.5, 0, 0} in create_world;
+	// the rest are zero-initialized. Reporting-only (see nudge.h).
+	Material materials[256];
+} WorldInternal;
+
+// -----------------------------------------------------------------------------
+// Solver types and constants.
+
+#define SOLVER_VELOCITY_ITERS      10
+#define SOLVER_POSITION_ITERS      4
+// SOLVER_BAUMGARTE removed: joints use NGS or LDL position correction, not velocity bias.
+#define SOLVER_SLOP                0.005f // NGS position correction dead zone
+#define SOLVER_RESTITUTION_THRESH  1.0f
+#define SOLVER_POS_BAUMGARTE       0.2f
+#define SOLVER_POS_MAX_CORRECTION  0.2f   // max position correction per step
+#define SOLVER_MAX_LINEAR_VEL      500.0f
+#define SOLVER_MAX_ANGULAR_VEL     100.0f
+
+typedef struct SolverContact
+{
+	// --- Hot fields for patch-mode PGS inner loop (first 92 bytes = 2 cache lines) ---
+	v3 r_a;              // contact offset from body A
+	v3 r_b;              // contact offset from body B
+	v3 rn_a, rn_b;       // precomputed cross(r, normal)
+	v3 w_n_a, w_n_b;     // precomputed I_w * cross(r, normal) — angular impulse direction
+	float eff_mass_n;    // 1/K for normal row
+	float bias;          // velocity bias for penetration recovery
+	float bounce;        // restitution velocity bias
+	float softness;      // soft constraint regularization (0 = rigid/NGS)
+	float lambda_n;      // accumulated normal impulse (>= 0)
+	// --- Cold fields (warm starting, position correction) ---
+	v3 normal;           // cached contact normal
+	float penetration;   // cached for position correction pass
+	uint32_t feature_id; // geometric feature key for warm starting
+} SolverContact;
+
+
+typedef struct SolverManifold
+{
+	int body_a, body_b;
+	uint32_t sub_id;              // 0 = convex pair; (tri_idx + 1) = mesh-triangle sub-manifold
+	int contact_start;
+	int contact_count;
+	float friction;
+	float rolling_friction;       // mu_roll: cap is rolling_friction * total_lambda_n
+	float inv_mass_a, inv_mass_b; // cached from body (avoids body array lookup during iteration)
+	// Manifold-level patch friction data (patch friction)
+	v3 centroid_r_a;
+	v3 centroid_r_b;
+	v3 tangent1, tangent2;
+	v3 normal;
+	v3 rolling_axis;              // snapshot of ω_tangent / |ω_tangent| at prestep, ⊥ normal
+	float eff_mass_t1, eff_mass_t2;
+	float eff_mass_twist;
+	float eff_mass_roll;          // 1 / (axis·(I_a_inv+I_b_inv)·axis); 0 if no rolling
+	float lambda_t1, lambda_t2;
+	float lambda_twist;
+	float lambda_roll;
+	float patch_area;
+	float patch_radius;
+} SolverManifold;
+
+// Per-contact body-local offsets. Parallel array to the SolverContact pool,
+// same layout (manifold_idx * MAX_CONTACTS + contact_idx). Populated at
+// pre-solve; consumed at the top of each substep (sub > 0) to rotate world
+// r_a/r_b from body-local so PGS, relax, NGS, and SIMD batches see fresh
+// lever arms when bodies rotate during the step.
+typedef struct SolverContactCold
+{
+	v3 r_a_local;
+	v3 r_b_local;
+} SolverContactCold;
+
+// Per-manifold body-local patch data. Parallel array to the SolverManifold
+// pool. Holds body-local versions of centroid_r_a / centroid_r_b so patch
+// friction rows get fresh lever arms at substep start.
+typedef struct SolverManifoldCold
+{
+	v3 centroid_r_a_local;
+	v3 centroid_r_b_local;
+} SolverManifoldCold;
+
+// Warm starting: cached impulses from previous frame, keyed by body pair.
+typedef struct WarmContact
+{
+	v3 r_a;              // body-A-relative position for spatial fallback matching
+	float lambda_n;
+	uint32_t feature_id; // geometric feature key for matching
+} WarmContact;
+
+struct WarmManifold
+{
+	WarmContact contacts[MAX_CONTACTS];
+	int count;
+	int stale; // 0 = updated this frame, incremented each frame not touched, evicted at >1
+	// Body indices are stored explicitly so warm_cache_age_and_evict can read
+	// them back without decoding the map key. For mesh pairs the key is
+	// hashed with sub_id and no longer round-trips to a (body_a, body_b) pair.
+	int body_a;
+	int body_b;
+	// Manifold-level friction warm data (patch friction)
+	float manifold_lambda_t1;
+	float manifold_lambda_t2;
+	float manifold_lambda_twist;
+	float manifold_lambda_roll;
+	v3 manifold_rolling_axis; // snapshot axis from last frame (used only for warm impulse re-application)
+	// Cached SAT axis for hill-climb warm-start (-1 = no cache).
+	int sat_axis;
+	// Cached feature pair for incremental narrowphase (skip full SAT when valid).
+	CachedFeaturePair cached_pair;
+};
+
+// -----------------------------------------------------------------------------
+// Joint solver types.
+
+// Max DOF per joint: 6 for future 6-DOF joints (currently hinge = 5).
+#define JOINT_MAX_DOF 6
+
+// Per-DOF Jacobian row: J_a and J_b each have 6 components [lin_x, lin_y, lin_z, ang_x, ang_y, ang_z].
+// Scalar effective mass = 1 / (J * M^-1 * J^T + softness).
+typedef struct JacobianRow
+{
+	float J_a[6];
+	float J_b[6];
+	float eff_mass;
+} JacobianRow;
+
+// Bounded 1-DOF row: axis + cross terms + scalar effective mass. Replaces
+// JacobianRow for bounded DOF solves -- the generic 12-float Jacobian is
+// overkill for a scalar constraint along a single axis. r_cross_a/b are
+// zero for pure-angular constraints (hinge DOF 5, angular motor, cone/twist).
+typedef struct BoundedAxis
+{
+	v3 axis;          // world-space constraint direction
+	v3 r_cross_a, r_cross_b;  // r x axis for linear constraints; zero for angular
+	float eff_mass;   // 1 / (J * M^-1 * J^T + softness)
+} BoundedAxis;
+
+// Unified solver joint: all joint types share one struct.
+// PGS and LDL both read/write the common fields. Per-DOF Jacobian rows
+// encode the constraint geometry; type-specific knowledge lives only in
+// joint_fill_rows (called from joints_pre_solve and ldl_refresh_lever_arms).
+typedef struct SolverJoint
+{
+	int body_a, body_b;
+	int joint_idx;
+	JointType type;
+	int dof;              // 1 (distance), 3 (ball socket), 5 (hinge)
+	float softness;
+
+	v3 r_a, r_b;         // world-space lever arms
+	float lambda[JOINT_MAX_DOF];
+	float bias[JOINT_MAX_DOF];
+	float pos_error[JOINT_MAX_DOF]; // raw position error per DOF (bias = ptv * pos_error)
+
+	// Clamp bounds (for future joint limits / motors).
+	// Default: lo=-FLT_MAX, hi=+FLT_MAX (bilateral, unclamped).
+	float lo[JOINT_MAX_DOF];
+	float hi[JOINT_MAX_DOF];
+
+	// Ball-socket-like 3-DOF linear block (packed sym3x3 inverse: xx,xy,xz,yy,yz,zz).
+	// Used by ball socket, hinge linear (DOF 0-2), fixed linear (DOF 0-2),
+	// prismatic lateral pair (computed differently), swing-twist linear.
+	float lin_inv_eff_mass[6];
+
+	// Hinge angular 2-DOF block: constraint axes u1,u2 and packed sym2x2 inverse [00,01,11].
+	v3 hinge_u1, hinge_u2;
+	float hinge_ang_inv_eff_mass[3];
+
+	// 3-DOF world-frame angular block (sym3x3 inverse of I_a^-1 + I_b^-1, packed).
+	// Used by fixed (DOF 3-5) and prismatic (DOF 2-4).
+	float ang3_inv_eff_mass[6];
+
+	// Prismatic lateral-linear block: 2 tangent axes perp. to slide axis +
+	// packed sym2x2 inverse of the 2-DOF lateral K matrix.
+	v3 prism_t1, prism_t2;
+	float prism_lateral_inv_eff_mass[3];
+
+	// Distance: world-space axis from anchor_a -> anchor_b, populated each
+	// substep so LDL and PGS can compute the 1-DOF Jacobian without reading
+	// body positions.
+	v3 dist_axis;
+
+	// Bounded 1-DOF rows (limits, motors, unilateral types). At most 2 per
+	// joint (e.g. swing-twist with both cone and twist active). Per-type DOF
+	// mapping (which lambda[d]/lo[d]/hi[d]/bias[d] each row uses):
+	//   distance (with limits): bounded[0] -> DOF 0 (linear)
+	//   hinge (with limits/motor): bounded[0] -> DOF 5 (angular)
+	//   prismatic (with motor): bounded[0] -> DOF 5 (linear)
+	//   angular_motor / cone_limit / twist_limit: bounded[0] -> DOF 0 (angular)
+	//   swing_twist: bounded[0] -> DOF 3 (cone, angular), bounded[1] -> DOF 4 (twist, angular)
+	BoundedAxis bounded[2];
+} SolverJoint;
+
+// Constraint ref for graph coloring dispatch.
+enum { CTYPE_CONTACT, CTYPE_JOINT };
+
+typedef struct ConstraintRef
+{
+	uint8_t type;
+	uint8_t color;
+	int index;
+	int body_a, body_b;
+} ConstraintRef;
+
+// Per-island solver state for a single step. One SolveIsland per active island
+// (plus optional -1 orphan bucket for both-static joints). Stores absolute
+// offsets into the flat crefs / simd_batches arrays so the PGS iter loop can
+// operate on one island at a time without needing per-island allocations.
+//
+// Invariants:
+//   refs for this island live in crefs[crefs_start .. crefs_start + crefs_count)
+//   color c's refs live in crefs[batch_starts[c] .. batch_starts[c + 1])
+//   contacts of color c: crefs[batch_starts[c] .. contact_end[c])
+//   joints   of color c: crefs[contact_end[c]  .. batch_starts[c + 1])
+//   SIMD contact batches of color c: simd_batches[simd_color_batch_starts[c] .. simd_color_batch_starts[c + 1])
+#define SOLVE_ISLAND_MAX_COLORS 64
+
+typedef struct SolveIsland
+{
+	int island_id;
+	int crefs_start;
+	int crefs_count;
+	int color_count;
+	int batch_starts[SOLVE_ISLAND_MAX_COLORS + 1];
+	int contact_end[SOLVE_ISLAND_MAX_COLORS];
+	int simd_batch_start;
+	int simd_batch_count;
+	int simd_color_batch_starts[SOLVE_ISLAND_MAX_COLORS + 1];
+} SolveIsland;
+
+// -----------------------------------------------------------------------------
+// LDL debug visualization data (populated by solver_ldl.c, read by UI).
+
+#define LDL_MAX_DOF 128
+
+typedef struct LDL_DebugInfo
+{
+	int n;                                // total DOFs
+	double A[LDL_MAX_DOF * LDL_MAX_DOF];  // constraint matrix snapshot
+	double D[LDL_MAX_DOF];                // diagonal pivots after factorization
+	double rhs[LDL_MAX_DOF];              // RHS (constraint violations) before solve
+	double lambda_ldl[LDL_MAX_DOF];       // exact lambdas after LDL solve
+	int valid;
+} LDL_DebugInfo;
+
+#endif // NUDGE_INTERNAL_H
