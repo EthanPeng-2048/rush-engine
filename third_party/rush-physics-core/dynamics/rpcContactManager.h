@@ -30,11 +30,13 @@
 #include "../common/rpcTypes.h"
 #include "../broadphase/rpcBroadPhase.h"
 #include "../common/rpcMemory.h"
+#include "../math/rpcVec3.h"
 
 //--------------------------------------------------------------------------------------------------
 // rpcContactManager
 //--------------------------------------------------------------------------------------------------
 struct rpcContactConstraint;
+struct rpcManifold;
 class rpcContactListener;
 struct rpcBox;
 class rpcBody;
@@ -64,11 +66,32 @@ public:
 	// Remove contacts without broadphase overlap
 	// Solves contact manifolds
 	void TestCollisions( void );
-	static void SolveCollision( void* param );
 
 	void RenderContacts( rpcRender* debugDrawer ) const;
 
 private:
+	// Warm-start carry-over from the previous step: only the fields warm-start
+	// matching needs, so TestCollisions never copies a full rpcManifold.
+	struct WarmStartSnapshot
+	{
+		rpcVec3 tangent[ 2 ];
+		i32 count;
+		struct
+		{
+			i32 fpKey;
+			r32 normalImpulse;
+			r32 tangentImpulse[ 2 ];
+		} pts[ 8 ];
+	};
+
+	// TestCollisions pipeline steps (one concern each):
+	bool ContactStillValid( const rpcContactConstraint* c ) const;	// CanCollide + broadphase overlap
+	void NarrowphaseUpdate( rpcContactConstraint* c );				// SolveCollision + ComputeBasis
+	void WarmStartMatch( rpcContactConstraint* c, const WarmStartSnapshot& old );	// feature-pair match + friction re-projection
+	void FireContactEdges( rpcContactConstraint* c );				// Begin/End edges -> listener
+
+	static void CaptureWarmStart( const rpcManifold& m, WarmStartSnapshot& out );
+
 	rpcContactConstraint* m_contactList;
 	i32 m_contactCount;
 	rpcStack* m_stack;

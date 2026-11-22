@@ -30,7 +30,6 @@
 #include "../dynamics/rpcBody.h"
 #include "../dynamics/rpcIsland.h"
 #include "../dynamics/rpcContact.h"
-#include "../dynamics/rpcIsland.h"
 #include "../dynamics/rpcContactSolver.h"
 #include "../collision/rpcBox.h"
 
@@ -68,10 +67,18 @@ void rpcScene::Step( )
 
 	m_contactManager.TestCollisions( );
 
+	SolveIslands( );
+	SyncAndFind( );
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcScene::SolveIslands( )
+{
 	for ( rpcBody* body = m_bodyList; body; body = body->m_next )
 		body->m_flags &= ~rpcBody::eIsland;
 
-	// Size the stack island, pick worst case size
+	// Size the stack island, pick worst case size: every body and every
+	// contact could land in a single island, so reserve for the full scene.
 	m_stack.Reserve(
 		sizeof( rpcBody* ) * m_bodyCount
 		+ sizeof( rpcVelocityState ) * m_bodyCount
@@ -113,65 +120,7 @@ void rpcScene::Step( )
 		if ( seed->m_flags & rpcBody::eStatic )
 			continue;
 
-		i32 stackCount = 0;
-		stack[ stackCount++ ] = seed;
-		island.m_bodyCount = 0;
-		island.m_contactCount = 0;
-
-		// Mark seed as apart of island
-		seed->m_flags |= rpcBody::eIsland;
-
-		// Perform DFS on constraint graph
-		while( stackCount > 0 )
-		{
-			// Decrement stack to implement iterative backtracking
-			rpcBody *body = stack[ --stackCount ];
-			island.Add( body );
-
-			// Awaken all bodies connected to the island
-			body->SetToAwake( );
-
-			// Do not search across static bodies to keep island
-			// formations as small as possible, however the static
-			// body itself should be apart of the island in order
-			// to properly represent a full contact
-			if ( body->m_flags & rpcBody::eStatic )
-				continue;
-
-			// Search all contacts connected to this body
-			rpcContactEdge* contacts = body->m_contactList;
-			for ( rpcContactEdge* edge = contacts; edge; edge = edge->next )
-			{
-				rpcContactConstraint *contact = edge->constraint;
-
-				// Skip contacts that have been added to an island already
-				if ( contact->m_flags & rpcContactConstraint::eIsland )
-					continue;
-
-				// Can safely skip this contact if it didn't actually collide with anything
-				if ( !(contact->m_flags & rpcContactConstraint::eColliding) )
-					continue;
-
-				// Skip sensors
-				if ( contact->A->sensor || contact->B->sensor )
-					continue;
-
-				// Mark island flag and add to island
-				contact->m_flags |= rpcContactConstraint::eIsland;
-				island.Add( contact );
-
-				// Attempt to add the other body in the contact to the island
-				// to simulate contact awakening propogation
-				rpcBody* other = edge->other;
-				if ( other->m_flags & rpcBody::eIsland )
-					continue;
-
-				assert( stackCount < stackSize );
-
-				stack[ stackCount++ ] = other;
-				other->m_flags |= rpcBody::eIsland;
-			}
-		}
+		BuildIsland( seed, island, stack, stackSize );
 
 		assert( island.m_bodyCount != 0 );
 
@@ -194,7 +143,75 @@ void rpcScene::Step( )
 	m_stack.Free( island.m_contacts );
 	m_stack.Free( island.m_velocities );
 	m_stack.Free( island.m_bodies );
+}
 
+//--------------------------------------------------------------------------------------------------
+void rpcScene::BuildIsland( rpcBody* seed, rpcIsland& island, rpcBody** stack, i32 stackSize )
+{
+	i32 stackCount = 0;
+	stack[ stackCount++ ] = seed;
+	island.m_bodyCount = 0;
+	island.m_contactCount = 0;
+
+	// Mark seed as apart of island
+	seed->m_flags |= rpcBody::eIsland;
+
+	// Perform DFS on constraint graph
+	while( stackCount > 0 )
+	{
+		// Decrement stack to implement iterative backtracking
+		rpcBody *body = stack[ --stackCount ];
+		island.Add( body );
+
+		// Awaken all bodies connected to the island
+		body->SetToAwake( );
+
+		// Do not search across static bodies to keep island
+		// formations as small as possible, however the static
+		// body itself should be apart of the island in order
+		// to properly represent a full contact
+		if ( body->m_flags & rpcBody::eStatic )
+			continue;
+
+		// Search all contacts connected to this body
+		rpcContactEdge* contacts = body->m_contactList;
+		for ( rpcContactEdge* edge = contacts; edge; edge = edge->next )
+		{
+			rpcContactConstraint *contact = edge->constraint;
+
+			// Skip contacts that have been added to an island already
+			if ( contact->m_flags & rpcContactConstraint::eIsland )
+				continue;
+
+			// Can safely skip this contact if it didn't actually collide with anything
+			if ( !(contact->m_flags & rpcContactConstraint::eColliding) )
+				continue;
+
+			// Skip sensors
+			if ( contact->A->sensor || contact->B->sensor )
+				continue;
+
+			// Mark island flag and add to island
+			contact->m_flags |= rpcContactConstraint::eIsland;
+			island.Add( contact );
+
+			// Attempt to add the other body in the contact to the island
+			// to simulate contact awakening propogation
+			rpcBody* other = edge->other;
+			if ( other->m_flags & rpcBody::eIsland )
+				continue;
+
+			assert( stackCount < stackSize );
+
+			stack[ stackCount++ ] = other;
+			other->m_flags |= rpcBody::eIsland;
+		}
+	}
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcScene::SyncAndFind( )
+{
 	// Update the broadphase AABBs
 	for ( rpcBody* body = m_bodyList; body; body = body->m_next )
 	{

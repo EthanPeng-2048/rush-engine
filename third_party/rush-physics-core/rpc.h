@@ -24,6 +24,20 @@
 */
 //--------------------------------------------------------------------------------------------------
 
+/**
+Error contract (L1 vs L2):
+  - L1 (this library) never uses exceptions and never returns Result objects.
+    Invalid input (null pointers, foreign handles, non-finite values) is a
+    caller contract violation: Debug builds assert; Release builds make the
+    operation a no-op where possible. No crash-by-design, no hidden retries.
+  - L2 adapters (rush-engine RushPhysicsCore) own validation and surface
+    errors as rush::Result / EX_FAIL to gameplay code.
+  - Query misses are not errors: RayHit.hit stays false, ReportShape is
+    simply not called.
+  - Contact listeners must be cheap: no allocations, no body create/destroy
+    inside BeginContact/EndContact — defer that work to the caller's stage.
+*/
+
 #ifndef RPC_H
 #define RPC_H
 

@@ -194,26 +194,100 @@ void rpcContactManager::RemoveFromBroadphase( rpcBody *body )
 }
 
 //--------------------------------------------------------------------------------------------------
+void rpcContactManager::CaptureWarmStart( const rpcManifold& m, WarmStartSnapshot& out )
+{
+	out.tangent[ 0 ] = m.tangentVectors[ 0 ];
+	out.tangent[ 1 ] = m.tangentVectors[ 1 ];
+	out.count = m.contactCount;
+
+	for ( i32 i = 0; i < m.contactCount; ++i )
+	{
+		out.pts[ i ].fpKey = m.contacts[ i ].fp.key;
+		out.pts[ i ].normalImpulse = m.contacts[ i ].normalImpulse;
+		out.pts[ i ].tangentImpulse[ 0 ] = m.contacts[ i ].tangentImpulse[ 0 ];
+		out.pts[ i ].tangentImpulse[ 1 ] = m.contacts[ i ].tangentImpulse[ 1 ];
+	}
+}
+
+//--------------------------------------------------------------------------------------------------
+bool rpcContactManager::ContactStillValid( const rpcContactConstraint* c ) const
+{
+	if ( !c->bodyA->CanCollide( c->bodyB ) )
+		return false;
+
+	return m_broadphase.TestOverlap( c->A->broadPhaseIndex, c->B->broadPhaseIndex );
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcContactManager::NarrowphaseUpdate( rpcContactConstraint* c )
+{
+	c->SolveCollision( );
+	rpcManifold* m = &c->manifold;
+	rpcComputeBasis( m->normal, m->tangentVectors, m->tangentVectors + 1 );
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcContactManager::WarmStartMatch( rpcContactConstraint* c, const WarmStartSnapshot& old )
+{
+	rpcManifold* manifold = &c->manifold;
+
+	for ( i32 i = 0; i < manifold->contactCount; ++i )
+	{
+		rpcContact *pc = manifold->contacts + i;
+		pc->tangentImpulse[ 0 ] = pc->tangentImpulse[ 1 ] = pc->normalImpulse = r32( 0.0 );
+		u8 oldWarmStart = pc->warmStarted;
+		pc->warmStarted = u8( 0 );
+
+		for ( i32 j = 0; j < old.count; ++j )
+		{
+			if ( pc->fp.key == old.pts[ j ].fpKey )
+			{
+				pc->normalImpulse = old.pts[ j ].normalImpulse;
+
+				// Attempt to re-project old friction solutions
+				rpcVec3 friction = old.tangent[ 0 ] * old.pts[ j ].tangentImpulse[ 0 ]
+					+ old.tangent[ 1 ] * old.pts[ j ].tangentImpulse[ 1 ];
+				pc->tangentImpulse[ 0 ] = rpcDot( friction, manifold->tangentVectors[ 0 ] );
+				pc->tangentImpulse[ 1 ] = rpcDot( friction, manifold->tangentVectors[ 1 ] );
+				pc->warmStarted = rpcMax( oldWarmStart, u8( oldWarmStart + 1 ) );
+				break;
+			}
+		}
+	}
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcContactManager::FireContactEdges( rpcContactConstraint* c )
+{
+	if ( !m_contactListener )
+		return;
+
+	i32 now_colliding = c->m_flags & rpcContactConstraint::eColliding;
+	i32 was_colliding = c->m_flags & rpcContactConstraint::eWasColliding;
+
+	if ( now_colliding && !was_colliding )
+		m_contactListener->BeginContact( c );
+
+	else if ( !now_colliding && was_colliding )
+		m_contactListener->EndContact( c );
+}
+
+//--------------------------------------------------------------------------------------------------
 void rpcContactManager::TestCollisions( void )
 {
 	rpcContactConstraint* constraint = m_contactList;
 
 	while( constraint )
 	{
-		rpcBox *A = constraint->A;
-		rpcBox *B = constraint->B;
-		rpcBody *bodyA = A->body;
-		rpcBody *bodyB = B->body;
-
 		constraint->m_flags &= ~rpcContactConstraint::eIsland;
 
-		if( !bodyA->IsAwake( ) && !bodyB->IsAwake( ) )
+		if( !constraint->bodyA->IsAwake( ) && !constraint->bodyB->IsAwake( ) )
 		{
 			constraint = constraint->next;
 			continue;
 		}
 
-		if ( !bodyA->CanCollide( bodyB ) )
+		if ( !ContactStillValid( constraint ) )
 		{
 			rpcContactConstraint* next = constraint->next;
 			RemoveContact( constraint );
@@ -221,56 +295,11 @@ void rpcContactManager::TestCollisions( void )
 			continue;
 		}
 
-		// Check if contact should persist
-		if ( !m_broadphase.TestOverlap( A->broadPhaseIndex, B->broadPhaseIndex ) )
-		{
-			rpcContactConstraint* next = constraint->next;
-			RemoveContact( constraint );
-			constraint = next;
-			continue;
-		}
-		rpcManifold* manifold = &constraint->manifold;
-		rpcManifold oldManifold = constraint->manifold;
-		rpcVec3 ot0 = oldManifold.tangentVectors[ 0 ];
-		rpcVec3 ot1 = oldManifold.tangentVectors[ 1 ];
-		constraint->SolveCollision( );
-		rpcComputeBasis( manifold->normal, manifold->tangentVectors, manifold->tangentVectors + 1 );
-
-		for ( i32 i = 0; i < manifold->contactCount; ++i )
-		{
-			rpcContact *c = manifold->contacts + i;
-			c->tangentImpulse[ 0 ] = c->tangentImpulse[ 1 ] = c->normalImpulse = r32( 0.0 );
-			u8 oldWarmStart = c->warmStarted;
-			c->warmStarted = u8( 0 );
-
-			for ( i32 j = 0; j < oldManifold.contactCount; ++j )
-			{
-				rpcContact *oc = oldManifold.contacts + j;
-				if ( c->fp.key == oc->fp.key )
-				{
-					c->normalImpulse = oc->normalImpulse;
-
-					// Attempt to re-project old friction solutions
-					rpcVec3 friction = ot0 * oc->tangentImpulse[ 0 ] + ot1 * oc->tangentImpulse[ 1 ];
-					c->tangentImpulse[ 0 ] = rpcDot( friction, manifold->tangentVectors[ 0 ] );
-					c->tangentImpulse[ 1 ] = rpcDot( friction, manifold->tangentVectors[ 1 ] );
-					c->warmStarted = rpcMax( oldWarmStart, u8( oldWarmStart + 1 ) );
-					break;
-				}
-			}
-		}
-
-		if ( m_contactListener )
-		{
-			i32 now_colliding = constraint->m_flags & rpcContactConstraint::eColliding;
-			i32 was_colliding = constraint->m_flags & rpcContactConstraint::eWasColliding;
-
-			if ( now_colliding && !was_colliding )
-				m_contactListener->BeginContact( constraint );
-
-			else if ( !now_colliding && was_colliding )
-				m_contactListener->EndContact( constraint );
-		}
+		WarmStartSnapshot old;
+		CaptureWarmStart( constraint->manifold, old );
+		NarrowphaseUpdate( constraint );
+		WarmStartMatch( constraint, old );
+		FireContactEdges( constraint );
 
 		constraint = constraint->next;
 	}

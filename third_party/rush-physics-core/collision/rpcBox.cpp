@@ -113,31 +113,17 @@ void rpcBox::ComputeAABB( const rpcTransform& tx, rpcAABB* aabb ) const
 {
 	rpcTransform world = rpcMul( tx, local );
 
-	rpcVec3 v[ 8 ] = {
-		rpcVec3( -e.x, -e.y, -e.z ),
-		rpcVec3( -e.x, -e.y,  e.z ),
-		rpcVec3( -e.x,  e.y, -e.z ),
-		rpcVec3( -e.x,  e.y,  e.z ),
-		rpcVec3(  e.x, -e.y, -e.z ),
-		rpcVec3(  e.x, -e.y,  e.z ),
-		rpcVec3(  e.x,  e.y, -e.z ),
-		rpcVec3(  e.x,  e.y,  e.z )
-	};
+	// OBB AABB: center +/- |R| * e (absolute rotation columns times extents),
+	// equivalent to the 8-corner min/max at a fraction of the cost.
+	const rpcMat3& R = world.rotation;
+	rpcVec3 extent(
+		rpcAbs( R.ex.x ) * e.x + rpcAbs( R.ey.x ) * e.y + rpcAbs( R.ez.x ) * e.z,
+		rpcAbs( R.ex.y ) * e.x + rpcAbs( R.ey.y ) * e.y + rpcAbs( R.ez.y ) * e.z,
+		rpcAbs( R.ex.z ) * e.x + rpcAbs( R.ey.z ) * e.y + rpcAbs( R.ez.z ) * e.z
+	);
 
-	for ( i32 i = 0; i < 8; ++i )
-		v[ i ] = rpcMul( world, v[ i ] );
-
-	rpcVec3 min( RPC_R32_MAX, RPC_R32_MAX, RPC_R32_MAX );
-	rpcVec3 max( -RPC_R32_MAX, -RPC_R32_MAX, -RPC_R32_MAX );
-
-	for ( i32 i = 0; i < 8; ++i )
-	{
-		min = rpcMin( min, v[ i ] );
-		max = rpcMax( max, v[ i ] );
-	}
-
-	aabb->min = min;
-	aabb->max = max;
+	aabb->min = world.position - extent;
+	aabb->max = world.position + extent;
 }
 
 //--------------------------------------------------------------------------------------------------

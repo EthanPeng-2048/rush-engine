@@ -1,8 +1,8 @@
 module;
 #include <algorithm>
 #include <cmath>
-#include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <cstdint>
 #include <functional>
@@ -40,7 +40,7 @@ Transform FromRpcTransform(const rpcTransform& t, const rpcQuaternion& q) {
 }
 
 // Real error channel for the RPC adapter (unlike qu3e/nudge compat layers).
-rush::Result<rpcBody*> FindBody(const std::map<BodyHandle, rpcBody*>& bodies, BodyHandle handle) {
+rush::Result<rpcBody*> FindBody(const std::unordered_map<BodyHandle, rpcBody*>& bodies, BodyHandle handle) {
     const auto it = bodies.find(handle);
     if (it == bodies.end() || !it->second) {
         EX_FAIL("rpc: invalid body handle " + std::to_string(handle));
@@ -48,7 +48,7 @@ rush::Result<rpcBody*> FindBody(const std::map<BodyHandle, rpcBody*>& bodies, Bo
     return it->second;
 }
 
-rush::Result<rpcBox*> FindBox(const std::map<BodyHandle, rpcBox*>& boxes, BodyHandle handle) {
+rush::Result<rpcBox*> FindBox(const std::unordered_map<BodyHandle, rpcBox*>& boxes, BodyHandle handle) {
     const auto it = boxes.find(handle);
     if (it == boxes.end() || !it->second) {
         EX_FAIL("rpc: invalid body handle " + std::to_string(handle));
@@ -92,11 +92,11 @@ public:
         : scene(stepDt, rpcVec3{0.f, -9.81f, 0.f}, 12) {}
 
     rpcScene scene;
-    std::map<BodyHandle, rpcBody*> bodies;
-    std::map<BodyHandle, rpcBox*> bodyBoxes;
+    std::unordered_map<BodyHandle, rpcBody*> bodies;
+    std::unordered_map<BodyHandle, rpcBox*> bodyBoxes;
     BodyHandle nextHandle = 1;
     std::vector<ContactEvent> contacts;
-    std::map<const rpcBox*, BodyHandle> boxToBody;
+    std::unordered_map<const rpcBox*, BodyHandle> boxToBody;
     std::vector<PendingForce> pendingForces;
 
     void BeginContact(const rpcContactConstraint* contact) override {
@@ -105,10 +105,15 @@ public:
         const rpcBody* b = contact->bodyB;
         if (!a || !b) return;
 
+        // O(1) reverse lookup via the box→handle map (each adapter body owns
+        // exactly one box). Never scan the body table on the contact path.
+        const auto itA = boxToBody.find(contact->A);
+        const auto itB = boxToBody.find(contact->B);
+        if (itA == boxToBody.end() || itB == boxToBody.end()) return;
+
         ContactEvent event;
-        event.bodyA = handleOf(a);
-        event.bodyB = handleOf(b);
-        if (event.bodyA == 0 || event.bodyB == 0) return;
+        event.bodyA = itA->second;
+        event.bodyB = itB->second;
 
         // rpcContact::position is already a world-space contact point.
         event.worldPoint = FromRpc(contact->manifold.contacts[0].position);
@@ -127,13 +132,6 @@ public:
     }
 
     void EndContact(const rpcContactConstraint*) override {}
-
-    BodyHandle handleOf(const rpcBody* body) const {
-        for (const auto& [handle, ptr] : bodies) {
-            if (ptr == body) return handle;
-        }
-        return 0;
-    }
 };
 
 namespace {
@@ -147,7 +145,7 @@ public:
     rpcRaycastData* ray = nullptr;
     float maxDistance = 0.f;
     BodyHandle ignore = kInvalidBody;
-    const std::map<const rpcBox*, BodyHandle>* boxToBody = nullptr;
+    const std::unordered_map<const rpcBox*, BodyHandle>* boxToBody = nullptr;
     RayHit result;
 
     bool ReportShape(rpcBox* box) override {

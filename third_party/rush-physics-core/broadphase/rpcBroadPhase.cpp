@@ -128,7 +128,10 @@ void rpcBroadPhase::UpdatePairs( )
 		}
 	}
 
+	// Debug-only tree integrity check (walks the free list — keep out of Release)
+#ifndef NDEBUG
 	m_tree.Validate( );
+#endif
 }
 
 //--------------------------------------------------------------------------------------------------

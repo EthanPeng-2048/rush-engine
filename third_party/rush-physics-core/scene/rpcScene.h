@@ -149,6 +149,14 @@ public:
 	void Dump( FILE* file ) const;
 
 private:
+	// Step pipeline stages (rpc-refactor.md D6): one concern per method.
+	void SolveIslands( );	// seed loop: BuildIsland per seed, then Initialize/Solve
+	void SyncAndFind( );	// SynchronizeProxies + FindNewContacts + clear forces
+
+	// DFS the constraint graph from seed into the working island. Stack must
+	// hold at least m_bodyCount entries.
+	void BuildIsland( rpcBody* seed, rpcIsland& island, rpcBody** stack, i32 stackSize );
+
 	rpcContactManager m_contactManager;
 	rpcPagedAllocator m_boxAllocator;
 
