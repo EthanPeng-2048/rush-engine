@@ -1,4 +1,4 @@
-﻿module;
+module;
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -9,44 +9,45 @@
 
 export module rush.engine.runtime;
 
-// Simulation runtime: owns the fixed-step worker thread and a double-buffered
-// snapshot handshake. Game code supplies the step function; render/input stay
-// on the caller thread and only ever observe the published snapshot.
+// Simulation runtime: owns the fixed-step worker thread and a snapshot
+// handshake. Game code supplies the step function; render/input stay on the
+// caller thread and only ever observe a stable copy of the published state.
 //
 // Modes:
 //   Inline   — Pump() runs steps on the caller thread (drive-test / WASM).
-//   Threaded — Start() spawns a worker; SwapPublished() never blocks the
-//              producer longer than a pointer exchange.
+//   Threaded — Start() spawns a worker; consumers CopyFront() once per frame.
 export namespace rush {
 
-// Double buffer: producer writes the back slot, then publishes with an
-// atomic index flip (release). Consumers read the front slot (acquire).
-// One full frame of tearing risk is accepted only on the back slot while
-// the consumer is not reading it — the flip is the sync point.
+// Producer/consumer snapshot handoff.
+//
+// ⚠ A bare Front() reference is unsafe with a second thread: Publish() flips
+// the index so the old front becomes the back slot and the producer overwrites
+// it while the consumer is still drawing — the car flickers between its
+// previous and current pose (seen clearly at race start). Consumers must
+// CopyFront() (mutex-protected value copy) and hold that copy for the frame.
 template <typename Snapshot>
 class SnapshotDoubleBuffer {
 public:
-    // Producer: mutable access to the back buffer (not yet published).
-    Snapshot& Back() { return slots_[back_]; }
+    // Producer-only: mutable staging slot (never read by consumers).
+    Snapshot& Back() { return staging_; }
 
-    // Producer: publish back → front. Returns the previous front index so
-    // the producer can reclaim it next frame (it becomes the new back).
-    int Publish() {
-        const int prevFront = front_.exchange(back_, std::memory_order_acq_rel);
-        back_ = prevFront;
-        return prevFront;
+    // Producer: publish staging → published (copy under lock).
+    void Publish() {
+        std::lock_guard lock(mutex_);
+        published_ = staging_;
     }
 
-    // Consumer: stable reference to the published snapshot. Valid until the
-    // next Publish() from the producer — copy out if you need longer.
-    const Snapshot& Front() const {
-        return slots_[front_.load(std::memory_order_acquire)];
+    // Consumer: value copy of the last published snapshot. Safe to keep for
+    // the rest of the frame while the producer publishes again.
+    [[nodiscard]] Snapshot CopyFront() const {
+        std::lock_guard lock(mutex_);
+        return published_;
     }
 
 private:
-    Snapshot slots_[2];
-    int back_ = 1;
-    std::atomic<int> front_{0};
+    mutable std::mutex mutex_;
+    Snapshot staging_;    // producer write target
+    Snapshot published_;  // consumer source (guarded by mutex_)
 };
 
 // Worker that repeatedly calls StepFn(dt) at a fixed rate (or as fast as
