@@ -1,4 +1,4 @@
-﻿module;
+module;
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -215,7 +215,7 @@ void Vehicle::Spawn(IPhysicsWorld& world, const Transform& pose, const VehiclePa
     desc.angularDamping = 0.25f;
     desc.allowSleep = false;
     desc.userData = userData;
-    chassis_ = world.CreateBody(desc);
+    chassis_ = world.CreateBody(desc).value_or(kInvalidBody);
 
     // Hardpoints: front axle at +wheelbase/2, rear at -wheelbase/2 (local +Z forward).
     const float halfWb = params.wheelbase * 0.5f;
@@ -249,7 +249,7 @@ void Vehicle::Spawn(IPhysicsWorld& world, const Transform& pose, const VehiclePa
 
 void Vehicle::Despawn() {
     if (world_ && chassis_ != kInvalidBody) {
-        world_->DestroyBody(chassis_);
+        (void)world_->DestroyBody(chassis_);
         chassis_ = kInvalidBody;
     }
     world_ = nullptr;
@@ -257,9 +257,9 @@ void Vehicle::Despawn() {
 
 void Vehicle::Reset(const Transform& pose) {
     if (!world_ || chassis_ == kInvalidBody) return;
-    world_->SetTransform(chassis_, pose);
-    world_->SetLinearVelocity(chassis_, Vec3{});
-    world_->SetAngularVelocity(chassis_, Vec3{});
+    (void)world_->SetTransform(chassis_, pose);
+    (void)world_->SetLinearVelocity(chassis_, Vec3{});
+    (void)world_->SetAngularVelocity(chassis_, Vec3{});
     for (int i = 0; i < 4; ++i) {
         state_.wheels[i].wear = 0.f;
         state_.wheels[i].temperature = 70.f;
@@ -275,47 +275,6 @@ void Vehicle::Reset(const Transform& pose) {
     escStrength_ = 0.f;
     state_.ersCharge = params_.ersBaseCharge;
     state_.wingMode = WingMode::ZMode;
-}
-
-Vehicle::AeroCoefficients Vehicle::ComputeAero() const {
-    AeroCoefficients aero;
-    const float frontH = state_.partHealth[static_cast<int>(CarPart::FrontWing)];
-    const float rearH = state_.partHealth[static_cast<int>(CarPart::RearWing)];
-    const float sideH = state_.partHealth[static_cast<int>(CarPart::Sidepods)];
-    const float floorH = state_.partHealth[static_cast<int>(CarPart::Floor)];
-
-    const float floorGain = 0.55f + 0.45f * floorH;
-    const float sideGain = 0.82f + 0.18f * sideH;
-
-    // Pitch shifts aero balance: a nose-down car (braking) moves the center
-    // of pressure forward. Nose-up pitch is positive (body forward.y > 0).
-    const float pitch =
-        std::asin(Clampf(TransformDirection(state_.transform, Vec3{0.f, 0.f, 1.f}).y, -1.f, 1.f));
-    const float frontShare = Clampf(params_.frontDownforceShare - params_.aeroPitchBalance * pitch,
-                                    0.30f, 0.58f);
-
-    aero.frontDownforceArea = params_.downforceArea * frontShare *
-                              (0.35f + 0.65f * frontH) * floorGain * sideGain;
-    aero.rearDownforceArea = params_.downforceArea * (1.f - frontShare) *
-                             (0.30f + 0.70f * rearH) * floorGain * sideGain;
-
-    // Damaged bodywork raises drag (torn surfaces).
-    aero.dragArea = params_.dragArea * (1.f + 0.35f * (1.f - sideH) + 0.25f * (1.f - frontH) +
-                                        0.30f * (1.f - rearH));
-
-    // 2026 X/Z-mode: X trims both downforce and drag, Z is high downforce.
-    if (state_.wingMode == WingMode::XMode) {
-        aero.frontDownforceArea *= 0.72f;
-        aero.rearDownforceArea *= 0.78f;
-        aero.dragArea *= 0.80f;
-    }
-
-    // DRS: rear wing flap opens — big drag cut, rear downforce loss.
-    if (state_.drsActive) {
-        aero.dragArea *= 0.74f;
-        aero.rearDownforceArea *= 0.55f;
-    }
-    return aero;
 }
 
 float Vehicle::SteerEnvelopeDeg(float speed) const {
@@ -337,8 +296,8 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     VehicleInput in = input;
     UpdateAssists(in);
 
-    const Transform transform = world_->GetTransform(chassis_);
-    const Vec3 velocity = world_->GetLinearVelocity(chassis_);
+    const Transform transform = world_->GetTransform(chassis_).value_or(Transform{});
+    const Vec3 velocity = world_->GetLinearVelocity(chassis_).value_or(Vec3{});
     const float speed = Length(velocity);
     const Vec3 forward = TransformDirection(transform, Vec3{0.f, 0.f, 1.f});
     const float forwardSpeed = Dot(velocity, forward);
@@ -368,7 +327,7 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     if (params_.steerLevel != AssistLevel::Off && speed > 6.f && !in.handbrake) {
         const float vRight = Dot(velocity, TransformDirection(transform, Vec3{-1.f, 0.f, 0.f}));
         const float beta = std::atan2(vRight, std::max(std::fabs(forwardSpeed), 3.f));
-        const float yawRate = Dot(world_->GetAngularVelocity(chassis_), Vec3{0.f, 1.f, 0.f});
+        const float yawRate = Dot(world_->GetAngularVelocity(chassis_).value_or(Vec3{}), Vec3{0.f, 1.f, 0.f});
         const float yawRef = forwardSpeed * std::tan(steerAngle_) / params_.wheelbase;
         const float excess = yawRate - yawRef;
         const bool oversteer = (std::fabs(excess) > 0.2f && std::fabs(beta) > 0.06f) ||
@@ -399,7 +358,7 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     }
     wingTogglePrev_ = in.wingToggle;
 
-    // DRS: available only inside a map-marked activation zone (zones.csv,
+    // DRS: available only inside a map-marked activation zone (map zones,
     // authored on straights) and only when the season enables DRS — no
     // speed or steering gate. Once the driver opens it, it stays open for
     // the whole zone: low speed and turning never close it. Leaving the
@@ -425,15 +384,38 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     UpdatePowertrain(in, dt);
 
     // --- Aero forces -------------------------------------------------------
-    const AeroCoefficients aero = ComputeAero();
+    // Areas come from the game (damage / DRS / wing mode / pitch balance);
+    // this layer only integrates q * A into forces. Unset (-1) falls back to
+    // VehicleParams base areas with a pitch balance split so bare-Vehicle
+    // unit tests keep a sane aero model without the game layer.
     const float v2 = speed * speed;
     const float dynPressure = 0.5f * params_.airDensity * v2;
 
-    const float frontDF = dynPressure * aero.frontDownforceArea;
-    const float rearDF = dynPressure * aero.rearDownforceArea;
+    float dragArea = params_.dragArea;
+    float frontDfArea = params_.downforceArea * params_.frontDownforceShare;
+    float rearDfArea = params_.downforceArea * (1.f - params_.frontDownforceShare);
+    const bool gameAero = in.dragArea >= 0.f && in.frontDownforceArea >= 0.f &&
+                          in.rearDownforceArea >= 0.f;
+    if (gameAero) {
+        dragArea = in.dragArea;
+        frontDfArea = in.frontDownforceArea;
+        rearDfArea = in.rearDownforceArea;
+    } else {
+        // Pitch shifts aero balance: a nose-down car (braking) moves the
+        // center of pressure forward. Nose-up pitch is positive.
+        const float pitch = std::asin(
+            Clampf(TransformDirection(transform, Vec3{0.f, 0.f, 1.f}).y, -1.f, 1.f));
+        const float frontShare =
+            Clampf(params_.frontDownforceShare - params_.aeroPitchBalance * pitch, 0.30f, 0.58f);
+        frontDfArea = params_.downforceArea * frontShare;
+        rearDfArea = params_.downforceArea * (1.f - frontShare);
+    }
+
+    const float frontDF = dynPressure * frontDfArea;
+    const float rearDF = dynPressure * rearDfArea;
     state_.frontDownforce = frontDF;
     state_.rearDownforce = rearDF;
-    state_.dragForce = dynPressure * aero.dragArea;
+    state_.dragForce = dynPressure * dragArea;
 
     // Downforce acts along -world-up through front/rear axles (split by share).
     const Vec3 worldUp{0.f, 1.f, 0.f};
@@ -442,15 +424,15 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
         const float frontFrac = frontDF / totalDF;
         const Vec3 frontPoint = transform.position + forward * (params_.wheelbase * 0.5f);
         const Vec3 rearPoint = transform.position - forward * (params_.wheelbase * 0.5f);
-        world_->ApplyForce(chassis_, -worldUp * frontDF, frontPoint);
-        world_->ApplyForce(chassis_, -worldUp * rearDF, rearPoint);
+        (void)world_->ApplyForce(chassis_, -worldUp * frontDF, frontPoint);
+        (void)world_->ApplyForce(chassis_, -worldUp * rearDF, rearPoint);
         (void)frontFrac;
     }
 
     // Drag opposes velocity through the center of pressure.
     if (speed > 0.2f) {
         const Vec3 cop = transform.position + forward * params_.centerOfPressureOffset;
-        world_->ApplyForce(chassis_, Normalize(velocity) * -state_.dragForce, cop);
+        (void)world_->ApplyForce(chassis_, Normalize(velocity) * -state_.dragForce, cop);
     }
 
     UpdateWheels(dt);
@@ -458,7 +440,7 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     // --- Collect state -----------------------------------------------------
     state_.transform = transform;
     state_.velocity = velocity;
-    state_.angularVelocity = world_->GetAngularVelocity(chassis_);
+    state_.angularVelocity = world_->GetAngularVelocity(chassis_).value_or(Vec3{});
     state_.speed = speed;
     state_.speedKmh = speed * 3.6f;
     state_.forwardSpeed = forwardSpeed;
@@ -477,8 +459,8 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
 }
 
 void Vehicle::UpdatePowertrain(const VehicleInput& input, float dt) {
-    const Transform transform = world_->GetTransform(chassis_);
-    const Vec3 velocity = world_->GetLinearVelocity(chassis_);
+    const Transform transform = world_->GetTransform(chassis_).value_or(Transform{});
+    const Vec3 velocity = world_->GetLinearVelocity(chassis_).value_or(Vec3{});
     const Vec3 forward = TransformDirection(transform, Vec3{0.f, 0.f, 1.f});
     const float forwardSpeed = Dot(velocity, forward);
 
@@ -551,14 +533,14 @@ void Vehicle::UpdatePowertrain(const VehicleInput& input, float dt) {
 
     // ERS overtake adds force at the same axle.
     if (state_.ersDeploying) {
-        const float v = std::max(8.f, Length(world_->GetLinearVelocity(chassis_)));
+        const float v = std::max(8.f, Length(world_->GetLinearVelocity(chassis_).value_or(Vec3{})));
         driveForce += params_.ersDeployPower * params_.overtakeMultiplier / v;
     }
 
     // Engine braking when off throttle.
     float brakeForce = brakeSmooth_ * params_.brakeForceMax;
-    if (throttleSmooth_ < 0.05f && gear_ > 0 && std::fabs(Dot(world_->GetLinearVelocity(chassis_),
-                                                               TransformDirection(world_->GetTransform(chassis_), Vec3{0, 0, 1}))) > 1.f) {
+    if (throttleSmooth_ < 0.05f && gear_ > 0 && std::fabs(Dot(world_->GetLinearVelocity(chassis_).value_or(Vec3{}),
+                                                               TransformDirection(world_->GetTransform(chassis_).value_or(Transform{}), Vec3{0, 0, 1}))) > 1.f) {
         brakeForce += params_.engineBrakeTorque * totalRatioNow / wheelRadius * 0.25f;
     }
     if (input.handbrake) brakeForce += params_.brakeForceMax * 0.65f;
@@ -587,7 +569,7 @@ void Vehicle::UpdatePowertrain(const VehicleInput& input, float dt) {
 }
 
 void Vehicle::UpdateWheels(float dt) {
-    const Transform transform = world_->GetTransform(chassis_);
+    const Transform transform = world_->GetTransform(chassis_).value_or(Transform{});
     const Vec3 up = TransformDirection(transform, Vec3{0.f, 1.f, 0.f});
     const Vec3 forward = TransformDirection(transform, Vec3{0.f, 0.f, 1.f});
     const Vec3 right = TransformDirection(transform, Vec3{1.f, 0.f, 0.f});
@@ -656,10 +638,10 @@ void Vehicle::UpdateWheels(float dt) {
             wheel.contactPoint = hit.point;
             wheel.contactNormal = hit.normal;
             wheel.load = normalForce;
-            wheel.contactVelocity = world_->GetVelocityAtPoint(chassis_, hit.point);
+            wheel.contactVelocity = world_->GetVelocityAtPoint(chassis_, hit.point).value_or(Vec3{});
 
             // Suspension force along the strut (chassis up).
-            world_->ApplyForce(chassis_, up * normalForce, hit.point);
+            (void)world_->ApplyForce(chassis_, up * normalForce, hit.point);
 
             // Tire forces in the wheel plane. The contact body carries a
             // SurfaceType tag (road / grass / gravel) so grip per surface is
@@ -686,7 +668,7 @@ void Vehicle::UpdateWheels(float dt) {
             const TireModel::Output tire = tires_[i].Compute(
                 normalForce * surfaceGrip, wheel.contactVelocity, wheelForward, wheelRight,
                 drivePerWheel_[i], brakeForce, dt, camber[i]);
-            world_->ApplyForce(chassis_, tire.force, hit.point);
+            (void)world_->ApplyForce(chassis_, tire.force, hit.point);
             wheel.force = tire.force;
             wheel.slipRatio = tire.slipRatio;
             wheel.slipAngleDeg = tire.slipAngleDeg;
@@ -712,13 +694,13 @@ void Vehicle::UpdateWheels(float dt) {
     // in the gravel sheds roughly 1g at racing speed — cutting the runoff is
     // never a shortcut.
     if (grassWheels > 0 || gravelWheels > 0) {
-        const Vec3 velocity = world_->GetLinearVelocity(chassis_);
+        const Vec3 velocity = world_->GetLinearVelocity(chassis_).value_or(Vec3{});
         const float speed = Length(velocity);
         if (speed > 0.3f) {
             float dragAccel = 0.f;
             dragAccel += (0.8f + 0.10f * speed) * static_cast<float>(grassWheels) * 0.25f;
             dragAccel += (1.6f + 0.16f * speed) * static_cast<float>(gravelWheels) * 0.25f;
-            world_->ApplyForce(chassis_, Normalize(velocity) * (-dragAccel * params_.mass),
+            (void)world_->ApplyForce(chassis_, Normalize(velocity) * (-dragAccel * params_.mass),
                                transform.position);
         }
     }
@@ -726,8 +708,8 @@ void Vehicle::UpdateWheels(float dt) {
 
 void Vehicle::UpdateAssists(VehicleInput& input) {
     if (!world_) return;
-    const Transform transform = world_->GetTransform(chassis_);
-    const Vec3 velocity = world_->GetLinearVelocity(chassis_);
+    const Transform transform = world_->GetTransform(chassis_).value_or(Transform{});
+    const Vec3 velocity = world_->GetLinearVelocity(chassis_).value_or(Vec3{});
     // Geometric right side is -X in the vehicle frame (+Z forward / +Y up).
     const Vec3 geoRight = TransformDirection(transform, Vec3{-1.f, 0.f, 0.f});
     const Vec3 up = TransformDirection(transform, Vec3{0.f, 1.f, 0.f});
@@ -755,7 +737,7 @@ void Vehicle::UpdateAssists(VehicleInput& input) {
     escStrength_ = 0.f;
     if (params_.escLevel != AssistLevel::Off && !input.handbrake && speed > 5.f) {
         const float beta = std::atan2(vRight, std::max(std::fabs(forwardSpeed), 3.f));
-        const float yawRate = Dot(world_->GetAngularVelocity(chassis_), up);
+        const float yawRate = Dot(world_->GetAngularVelocity(chassis_).value_or(Vec3{}), up);
         const float yawRef = forwardSpeed * std::tan(steerAngle_) / params_.wheelbase;
         const float excess = yawRate - yawRef;
         const bool full = params_.escLevel == AssistLevel::Full;
@@ -773,18 +755,13 @@ void Vehicle::UpdateAssists(VehicleInput& input) {
             // Yaw damping about +Y (a right turn is negative yaw). Gains
             // mirror the reference game's 6.6 / 4.3 stabilizer scaled by Iz.
             const float iz = params_.mass * 1.6f;
-            world_->ApplyTorque(
+            (void)world_->ApplyTorque(
                 chassis_, Vec3{0.f, -iz * (6.6f * excess + 4.3f * beta) * strength, 0.f});
             // Lateral damping kills the sideways velocity component.
-            world_->ApplyForce(
+            (void)world_->ApplyForce(
                 chassis_, geoRight * (-1.9f * params_.mass * vRight * strength), transform.position);
         }
     }
-}
-
-void Vehicle::UpdateAero(float) {
-    // Aero coefficients are recomputed in Update() from wing mode, DRS and
-    // damage; this hook is reserved for future aero maps (speed-dependent Cl).
 }
 
 void Vehicle::ProcessContacts(const std::vector<ContactEvent>& contacts, float) {
@@ -797,7 +774,7 @@ void Vehicle::ProcessContacts(const std::vector<ContactEvent>& contacts, float) 
 
 void Vehicle::UpdateDamageFromContact(const ContactEvent& event) {
     if (!world_ || !params_.damageEnabled) return;
-    const Transform transform = world_->GetTransform(chassis_);
+    const Transform transform = world_->GetTransform(chassis_).value_or(Transform{});
 
     // Map the world contact point into chassis-local space and pick the part
     // whose region contains it. Local axes: +X right, +Y up, +Z forward.
@@ -837,7 +814,7 @@ void Vehicle::UpdateDamageFromContact(const ContactEvent& event) {
 
 void Vehicle::Render(IRenderer& renderer, const Color& tint) const {
     if (!world_ || chassis_ == kInvalidBody) return;
-    const Transform transform = world_->GetTransform(chassis_);
+    const Transform transform = world_->GetTransform(chassis_).value_or(Transform{});
     RenderPose(renderer, transform, state_, params_, tint);
 }
 

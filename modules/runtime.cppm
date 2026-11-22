@@ -1,8 +1,9 @@
-﻿module;
+module;
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -18,36 +19,62 @@ export module rush.engine.runtime;
 //   Threaded — Start() spawns a worker; consumers CopyFront() once per frame.
 export namespace rush {
 
-// Producer/consumer snapshot handoff.
+// Producer/consumer snapshot handoff — triple-buffered shared ownership.
 //
-// ⚠ A bare Front() reference is unsafe with a second thread: Publish() flips
-// the index so the old front becomes the back slot and the producer overwrites
-// it while the consumer is still drawing — the car flickers between its
-// previous and current pose (seen clearly at race start). Consumers must
-// CopyFront() (mutex-protected value copy) and hold that copy for the frame.
+// Three slots rotate between producer-exclusive (Back()), published, and
+// spare. Publish() is an O(1) pointer swap — the payload is never copied on
+// the producer side. CopyFront() hands out a shared_ptr, so the consumer
+// pays only a refcount per frame instead of a deep snapshot copy, and may
+// hold the result for the whole frame while the producer keeps publishing.
+//
+// ⚠ A bare reference into a slot is unsafe: the producer reuses slots and
+// would overwrite a pose mid-draw (the race-start flicker seen with the
+// original Front() API). Always go through CopyFront().
+//
+// The mutex only serializes pointer swaps and refcount handoff — never a
+// payload copy. If the consumer still holds the slot Publish() would recycle
+// (a stalled frame), the spare slot takes over; if that is held too, a fresh
+// slot is minted and the contested one dies with the consumer's reference.
 template <typename Snapshot>
-class SnapshotDoubleBuffer {
+class SnapshotTripleBuffer {
 public:
-    // Producer-only: mutable staging slot (never read by consumers).
-    Snapshot& Back() { return staging_; }
-
-    // Producer: publish staging → published (copy under lock).
-    void Publish() {
-        std::lock_guard lock(mutex_);
-        published_ = staging_;
+    SnapshotTripleBuffer() {
+        staging_ = std::make_shared<Snapshot>();
+        published_ = std::make_shared<Snapshot>();
+        spare_ = std::make_shared<Snapshot>();
     }
 
-    // Consumer: value copy of the last published snapshot. Safe to keep for
-    // the rest of the frame while the producer publishes again.
-    [[nodiscard]] Snapshot CopyFront() const {
+    // Producer-only: mutable staging slot (never read by consumers).
+    Snapshot& Back() { return *staging_; }
+
+    // Producer: publish staging → published (pointer swap, no payload copy).
+    void Publish() {
+        std::lock_guard lock(mutex_);
+        std::swap(staging_, published_);
+        if (staging_.use_count() > 1) {
+            // Consumer still holds the old published slot — never write into
+            // a shared buffer. Prefer the spare; mint one only when the
+            // consumer is holding that too (two frames behind).
+            if (spare_.use_count() == 1) {
+                std::swap(staging_, spare_);
+            } else {
+                staging_ = std::make_shared<Snapshot>();
+            }
+        }
+    }
+
+    // Consumer: shared handle on the last published snapshot. Safe to keep
+    // for the rest of the frame (and beyond) while the producer publishes.
+    [[nodiscard]] std::shared_ptr<const Snapshot> CopyFront() const {
         std::lock_guard lock(mutex_);
         return published_;
     }
 
 private:
     mutable std::mutex mutex_;
-    Snapshot staging_;    // producer write target
-    Snapshot published_;  // consumer source (guarded by mutex_)
+    std::shared_ptr<Snapshot> staging_;    // producer write target
+    std::shared_ptr<Snapshot> published_;  // consumer source
+    std::shared_ptr<Snapshot> spare_;      // rotation reserve
 };
 
 // Worker that repeatedly calls StepFn(dt) at a fixed rate (or as fast as

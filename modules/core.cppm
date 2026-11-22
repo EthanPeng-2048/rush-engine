@@ -1,8 +1,9 @@
-﻿module;
+module;
 #include <cmath>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <exstl/errors.hpp>
 #include <exstl/error_macros.hpp>
 
@@ -131,7 +132,8 @@ inline float Signf(float v) { return v >= 0.f ? 1.f : -1.f; }
 
 
 
-// Minimal INI-style config persisted next to the EXE (config.ini).
+// Key-value config persisted next to the EXE as config.rushconf (KVRec).
+// Section/key API is unchanged for game code; storage is KVRec under the hood.
 class Config {
 public:
     bool Load(const std::string& path);
@@ -149,19 +151,74 @@ private:
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> values_;
 };
 
+// Data-driven map loaded from a .rushmap file (KVRec v2). Authoring still
+// goes Python/CSV -> tools/mapconv -> <name>.rushmap; runtime only reads
+// the binary form.
+struct MapData {
+    struct WayPoint {
+        Vec3 position;
+        float width = 12.f;
+        float grassLeft = 0.f, gravelLeft = 0.f;
+        float grassRight = 0.f, gravelRight = 0.f;
+    };
 
+    struct Decor {
+        int type = 0;  // 0 = tree
+        Vec3 position;
+        float scale = 1.f;
+    };
 
+    // DRS activation zone as a lap-length fraction (0..1). Converted to
+    // arc length by Track::Build.
+    struct DrsZone {
+        float start = 0.f;
+        float end = 0.f;
+    };
 
-// Data root for config.ini and assets/: resolved once at first use so the
+    std::string name;
+    std::vector<WayPoint> centerline;
+    std::vector<Decor> decor;
+    std::vector<DrsZone> drsZones;
+
+    // Regular height-post grid (sorted unique axes + row-major heights).
+    std::vector<float> gridX, gridZ;
+    std::vector<float> gridY;  // gridZ.size() rows x gridX.size() cols
+
+    bool ok = false;
+
+    // Bilinear terrain height (gridY outside clamps to the edge value).
+    float TerrainHeight(float x, float z) const;
+    float MinTerrainY() const;
+};
+
+// Load mapsRoot/<name>.rushmap (optional .rushmap suffix on name tolerated).
+// Missing/corrupt file or centerline < 3 points => ok=false.
+MapData LoadMapData(const std::string& mapsRoot, const std::string& name);
+
+// Map basenames under mapsRoot (*.rushmap). Empty on failure.
+std::vector<std::string> ListMaps(const std::string& mapsRoot);
+
+// Write mapsRoot/<name>.rushmap from map (mapconv / editor).
+bool SaveMapData(const std::string& mapsRoot, const std::string& name, const MapData& map);
+
+// Read/write a single file path (mapconv CLI).
+MapData LoadMapFromFile(const std::string& path);
+bool SaveMapToFile(const std::string& path, const MapData& map);
+
+// Authoring import: read a CSV map directory (track/terrain/decor/zones).
+// Used by tools/mapconv; runtime game path uses LoadMapData only.
+MapData LoadMapFromCsvDir(const std::string& dir);
+
+// Data root for config.rushconf and assets/: resolved once at first use so the
 // game finds its data regardless of the working directory. Search order:
 //   1. current directory (normal in-tree runs)
 //   2. the executable's directory (shipped layout: exe next to assets/)
 //   3. the executable's parent (running build\apex-rush.exe in-tree)
-// The first root containing assets/maps wins; config.ini lives in the same
+// The first root containing assets/maps wins; config.rushconf lives in the same
 // root so settings never split across directories.
 const std::string& DataRoot();
 
-// DataRoot() + "/" + rel ("config.ini", "assets/maps", ...).
+// DataRoot() + "/" + rel ("config.rushconf", "assets/maps", ...).
 std::string DataPath(const std::string& rel);
 
 

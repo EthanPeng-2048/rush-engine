@@ -1,5 +1,6 @@
 module;
 #include <array>
+#include <cmath>
 #include <string>
 #include <cstdint>
 #include <functional>
@@ -58,6 +59,8 @@ struct RayHit {
     Vec3 normal;
     float fraction = 0.f;      // 0..1 along the ray
     void* userData = nullptr;
+    // Coulomb mu of the hit surface (from the hit body/shape). 0 when miss.
+    float friction = 0.f;
 };
 
 // Contact reported for damage mapping. `localPointA/B` are contact points in
@@ -75,9 +78,44 @@ struct ContactEvent {
     void* userDataB = nullptr;
 };
 
+// Generic Coulomb mix — same geometric-mean rule as q3/rpc/nudge contact
+// solvers. Used as the compatibility path when a backend lacks a native mix.
+inline float MixFriction(float a, float b) {
+    const float ua = a > 0.f ? a : 0.f;
+    const float ub = b > 0.f ? b : 0.f;
+    return std::sqrt(ua * ub);
+}
+
+// Which contact-friction / raycast extras the backend implements natively.
+// Compat (non-native) paths still work but may only affect queries, not the
+// contact solver (e.g. nudge has no runtime body-friction setter).
+enum class PhysicsCapability : uint32_t {
+    None = 0,
+    NativeSetFriction = 1u << 0,       // SetFriction feeds the solver
+    NativeRaycastFriction = 1u << 1,   // Raycast.friction from native shapes
+    NativeContactFriction = 1u << 2,   // GetContactFriction uses native mix
+};
+
+inline PhysicsCapability operator|(PhysicsCapability a, PhysicsCapability b) {
+    return static_cast<PhysicsCapability>(static_cast<uint32_t>(a) |
+                                          static_cast<uint32_t>(b));
+}
+inline bool HasCapability(PhysicsCapability set, PhysicsCapability flag) {
+    return (static_cast<uint32_t>(set) & static_cast<uint32_t>(flag)) != 0;
+}
+
 // Unified physics/collision interface. The vehicle model drives the world
 // through this interface only, so qu3e can be swapped for Jolt (CCD, convex
 // hulls) without touching gameplay code.
+//
+// Error contract (rush::Result = exstl::Result, no exceptions):
+//  - Fallible body ops return Result; invalid handles are errors on RPC
+//    (EX_FAIL). Qu3e/Nudge adapters always succeed — invalid handles yield
+//    default/sentinel values wrapped as success (compat layer, no failure
+//    branch). Raycast miss is not an error (RayHit.hit == false).
+//  - Hot-path callers should use value_or / discard Result<void>; creation
+//    paths may inspect the error. L1 physics cores stay assert/bool only —
+//    Result lives in this L2 interface, not inside qu3e/nudge/rpc*.
 class IPhysicsWorld {
 public:
     virtual ~IPhysicsWorld() = default;
@@ -85,28 +123,54 @@ public:
     virtual void SetGravity(const Vec3& gravity) = 0;
     virtual void Step(float dt) = 0;
 
-    virtual BodyHandle CreateBody(const BodyDesc& desc) = 0;
-    virtual void DestroyBody(BodyHandle body) = 0;
+    [[nodiscard]] virtual rush::Result<BodyHandle> CreateBody(const BodyDesc& desc) = 0;
+    [[nodiscard]] virtual rush::Result<void> DestroyBody(BodyHandle body) = 0;
 
-    virtual Transform GetTransform(BodyHandle body) const = 0;
-    virtual void SetTransform(BodyHandle body, const Transform& transform) = 0;
+    [[nodiscard]] virtual rush::Result<Transform> GetTransform(BodyHandle body) const = 0;
+    [[nodiscard]] virtual rush::Result<void> SetTransform(BodyHandle body,
+                                                          const Transform& transform) = 0;
 
-    virtual Vec3 GetLinearVelocity(BodyHandle body) const = 0;
-    virtual Vec3 GetAngularVelocity(BodyHandle body) const = 0;
-    virtual void SetLinearVelocity(BodyHandle body, const Vec3& velocity) = 0;
-    virtual void SetAngularVelocity(BodyHandle body, const Vec3& velocity) = 0;
-    virtual Vec3 GetVelocityAtPoint(BodyHandle body, const Vec3& worldPoint) const = 0;
+    [[nodiscard]] virtual rush::Result<Vec3> GetLinearVelocity(BodyHandle body) const = 0;
+    [[nodiscard]] virtual rush::Result<Vec3> GetAngularVelocity(BodyHandle body) const = 0;
+    [[nodiscard]] virtual rush::Result<void> SetLinearVelocity(BodyHandle body,
+                                                               const Vec3& velocity) = 0;
+    [[nodiscard]] virtual rush::Result<void> SetAngularVelocity(BodyHandle body,
+                                                                const Vec3& velocity) = 0;
+    [[nodiscard]] virtual rush::Result<Vec3> GetVelocityAtPoint(BodyHandle body,
+                                                                const Vec3& worldPoint) const = 0;
 
-    virtual void ApplyForce(BodyHandle body, const Vec3& force, const Vec3& worldPoint) = 0;
-    virtual void ApplyImpulse(BodyHandle body, const Vec3& impulse, const Vec3& worldPoint) = 0;
-    virtual void ApplyTorque(BodyHandle body, const Vec3& torque) = 0;
+    [[nodiscard]] virtual rush::Result<void> ApplyForce(BodyHandle body, const Vec3& force,
+                                                        const Vec3& worldPoint) = 0;
+    [[nodiscard]] virtual rush::Result<void> ApplyImpulse(BodyHandle body, const Vec3& impulse,
+                                                          const Vec3& worldPoint) = 0;
+    [[nodiscard]] virtual rush::Result<void> ApplyTorque(BodyHandle body, const Vec3& torque) = 0;
 
     // Raycast against all bodies. `ignore` skips one body (usually the caster).
+    // On hit, friction is the surface Coulomb mu (native when supported).
+    // Miss is not an error — returns RayHit{hit=false}.
     virtual RayHit Raycast(const Vec3& origin, const Vec3& direction, float maxDistance,
                            BodyHandle ignore = kInvalidBody) const = 0;
 
     // Contacts from the most recent Step(). Used for damage part mapping.
     virtual std::vector<ContactEvent> DrainContacts() = 0;
+
+    // --- Contact friction / extended raycast ------------------------------
+    // RPC forwards these straight to rush-physics-core. Qu3e/Nudge forward
+    // where the stock engine exposes the data; otherwise the adapter uses the
+    // generic path (MixFriction / BodyDesc cache). See Capabilities().
+
+    [[nodiscard]] virtual PhysicsCapability Capabilities() const = 0;
+
+    // Coulomb mu stored on the body (first shape / body default).
+    [[nodiscard]] virtual rush::Result<float> GetFriction(BodyHandle body) const = 0;
+
+    // Runtime mu update. Native backends write through to the solver shapes;
+    // compat backends may only update query-visible state (see Capabilities).
+    [[nodiscard]] virtual rush::Result<void> SetFriction(BodyHandle body, float friction) = 0;
+
+    // Effective contact mu for a pair (native mix or MixFriction fallback).
+    [[nodiscard]] virtual rush::Result<float> GetContactFriction(BodyHandle a,
+                                                                 BodyHandle b) const = 0;
 };
 
 
@@ -125,26 +189,33 @@ public:
     void SetGravity(const Vec3& gravity) override;
     void Step(float dt) override;
 
-    BodyHandle CreateBody(const BodyDesc& desc) override;
-    void DestroyBody(BodyHandle body) override;
+    rush::Result<BodyHandle> CreateBody(const BodyDesc& desc) override;
+    rush::Result<void> DestroyBody(BodyHandle body) override;
 
-    Transform GetTransform(BodyHandle body) const override;
-    void SetTransform(BodyHandle body, const Transform& transform) override;
+    rush::Result<Transform> GetTransform(BodyHandle body) const override;
+    rush::Result<void> SetTransform(BodyHandle body, const Transform& transform) override;
 
-    Vec3 GetLinearVelocity(BodyHandle body) const override;
-    Vec3 GetAngularVelocity(BodyHandle body) const override;
-    void SetLinearVelocity(BodyHandle body, const Vec3& velocity) override;
-    void SetAngularVelocity(BodyHandle body, const Vec3& velocity) override;
-    Vec3 GetVelocityAtPoint(BodyHandle body, const Vec3& worldPoint) const override;
+    rush::Result<Vec3> GetLinearVelocity(BodyHandle body) const override;
+    rush::Result<Vec3> GetAngularVelocity(BodyHandle body) const override;
+    rush::Result<void> SetLinearVelocity(BodyHandle body, const Vec3& velocity) override;
+    rush::Result<void> SetAngularVelocity(BodyHandle body, const Vec3& velocity) override;
+    rush::Result<Vec3> GetVelocityAtPoint(BodyHandle body, const Vec3& worldPoint) const override;
 
-    void ApplyForce(BodyHandle body, const Vec3& force, const Vec3& worldPoint) override;
-    void ApplyImpulse(BodyHandle body, const Vec3& impulse, const Vec3& worldPoint) override;
-    void ApplyTorque(BodyHandle body, const Vec3& torque) override;
+    rush::Result<void> ApplyForce(BodyHandle body, const Vec3& force,
+                                  const Vec3& worldPoint) override;
+    rush::Result<void> ApplyImpulse(BodyHandle body, const Vec3& impulse,
+                                    const Vec3& worldPoint) override;
+    rush::Result<void> ApplyTorque(BodyHandle body, const Vec3& torque) override;
 
     RayHit Raycast(const Vec3& origin, const Vec3& direction, float maxDistance,
                    BodyHandle ignore) const override;
 
     std::vector<ContactEvent> DrainContacts() override;
+
+    PhysicsCapability Capabilities() const override;
+    rush::Result<float> GetFriction(BodyHandle body) const override;
+    rush::Result<void> SetFriction(BodyHandle body, float friction) override;
+    rush::Result<float> GetContactFriction(BodyHandle a, BodyHandle b) const override;
 
 private:
     struct Impl;
@@ -159,6 +230,7 @@ private:
 // (Material.user_data), so RayHit / ContactEvent report them like qu3e's
 // per-body userData. Force/torque accumulate into velocity deltas because
 // nudge exposes no force API; rotation sets recreate the body (no setter).
+// Friction: create-time BodyParams only — SetFriction is compat (queries).
 class NudgeWorld final : public IPhysicsWorld {
 public:
     NudgeWorld();
@@ -167,26 +239,87 @@ public:
     void SetGravity(const Vec3& gravity) override;
     void Step(float dt) override;
 
-    BodyHandle CreateBody(const BodyDesc& desc) override;
-    void DestroyBody(BodyHandle body) override;
+    rush::Result<BodyHandle> CreateBody(const BodyDesc& desc) override;
+    rush::Result<void> DestroyBody(BodyHandle body) override;
 
-    Transform GetTransform(BodyHandle body) const override;
-    void SetTransform(BodyHandle body, const Transform& transform) override;
+    rush::Result<Transform> GetTransform(BodyHandle body) const override;
+    rush::Result<void> SetTransform(BodyHandle body, const Transform& transform) override;
 
-    Vec3 GetLinearVelocity(BodyHandle body) const override;
-    Vec3 GetAngularVelocity(BodyHandle body) const override;
-    void SetLinearVelocity(BodyHandle body, const Vec3& velocity) override;
-    void SetAngularVelocity(BodyHandle body, const Vec3& velocity) override;
-    Vec3 GetVelocityAtPoint(BodyHandle body, const Vec3& worldPoint) const override;
+    rush::Result<Vec3> GetLinearVelocity(BodyHandle body) const override;
+    rush::Result<Vec3> GetAngularVelocity(BodyHandle body) const override;
+    rush::Result<void> SetLinearVelocity(BodyHandle body, const Vec3& velocity) override;
+    rush::Result<void> SetAngularVelocity(BodyHandle body, const Vec3& velocity) override;
+    rush::Result<Vec3> GetVelocityAtPoint(BodyHandle body, const Vec3& worldPoint) const override;
 
-    void ApplyForce(BodyHandle body, const Vec3& force, const Vec3& worldPoint) override;
-    void ApplyImpulse(BodyHandle body, const Vec3& impulse, const Vec3& worldPoint) override;
-    void ApplyTorque(BodyHandle body, const Vec3& torque) override;
+    rush::Result<void> ApplyForce(BodyHandle body, const Vec3& force,
+                                  const Vec3& worldPoint) override;
+    rush::Result<void> ApplyImpulse(BodyHandle body, const Vec3& impulse,
+                                    const Vec3& worldPoint) override;
+    rush::Result<void> ApplyTorque(BodyHandle body, const Vec3& torque) override;
 
     RayHit Raycast(const Vec3& origin, const Vec3& direction, float maxDistance,
                    BodyHandle ignore = kInvalidBody) const override;
 
     std::vector<ContactEvent> DrainContacts() override;
+
+    PhysicsCapability Capabilities() const override;
+    rush::Result<float> GetFriction(BodyHandle body) const override;
+    rush::Result<void> SetFriction(BodyHandle body, float friction) override;
+    rush::Result<float> GetContactFriction(BodyHandle a, BodyHandle b) const override;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+
+
+
+// Rush Physics Core — first-party fork of qu3e (symbols rpc*), peer to
+// Qu3eWorld / NudgeWorld under [physics] engine. Deep-customization
+// **collision** backend only (island step, solver, queries). Vehicle
+// dynamics stay on the shared Vehicle API in L2 and never move into
+// rush-physics-core (see third_party/rush-physics-core/vehicle/README.md).
+// Contact friction / raycast extras forward straight to rpc* native data.
+// Unlike the qu3e/nudge compat adapters, RPC reports invalid handles and
+// bad BodyDesc fields as rush::Result errors (EX_FAIL).
+class RushPhysicsCore final : public IPhysicsWorld {
+public:
+    // stepDt: rpcScene advances this fixed dt on every Step() — pass the
+    // game's physics rate ([physics] hz) so the setting is real.
+    explicit RushPhysicsCore(float stepDt = 1.f / 240.f);
+    ~RushPhysicsCore() override;
+
+    void SetGravity(const Vec3& gravity) override;
+    void Step(float dt) override;
+
+    rush::Result<BodyHandle> CreateBody(const BodyDesc& desc) override;
+    rush::Result<void> DestroyBody(BodyHandle body) override;
+
+    rush::Result<Transform> GetTransform(BodyHandle body) const override;
+    rush::Result<void> SetTransform(BodyHandle body, const Transform& transform) override;
+
+    rush::Result<Vec3> GetLinearVelocity(BodyHandle body) const override;
+    rush::Result<Vec3> GetAngularVelocity(BodyHandle body) const override;
+    rush::Result<void> SetLinearVelocity(BodyHandle body, const Vec3& velocity) override;
+    rush::Result<void> SetAngularVelocity(BodyHandle body, const Vec3& velocity) override;
+    rush::Result<Vec3> GetVelocityAtPoint(BodyHandle body, const Vec3& worldPoint) const override;
+
+    rush::Result<void> ApplyForce(BodyHandle body, const Vec3& force,
+                                  const Vec3& worldPoint) override;
+    rush::Result<void> ApplyImpulse(BodyHandle body, const Vec3& impulse,
+                                    const Vec3& worldPoint) override;
+    rush::Result<void> ApplyTorque(BodyHandle body, const Vec3& torque) override;
+
+    RayHit Raycast(const Vec3& origin, const Vec3& direction, float maxDistance,
+                   BodyHandle ignore = kInvalidBody) const override;
+
+    std::vector<ContactEvent> DrainContacts() override;
+
+    PhysicsCapability Capabilities() const override;
+    rush::Result<float> GetFriction(BodyHandle body) const override;
+    rush::Result<void> SetFriction(BodyHandle body, float friction) override;
+    rush::Result<float> GetContactFriction(BodyHandle a, BodyHandle b) const override;
 
 private:
     struct Impl;
@@ -305,8 +438,9 @@ private:
 
 
 
-// Aerodynamic parts that can be damaged. Damage lowers part health in [0,1]
-// and modulates the aero coefficients (see AeroCoefficients).
+// Aerodynamic parts that can be damaged. Damage lowers part health in [0,1].
+// How that health maps onto drag/downforce is a game rule — the game writes
+// the resulting areas into VehicleInput; the engine only applies forces.
 enum class CarPart : int {
     FrontWing = 0,
     RearWing = 1,
@@ -382,8 +516,10 @@ struct VehicleParams {
 
     // Season rules ([season] in config): classic (DRS) and 2026 (active
     // aero + override) never mix. Game sets these from the season preset /
-    // per-feature toggles at spawn; the vehicle gates the features itself
-    // so a stale input can't leak a disabled system.
+    // per-feature toggles at spawn; the vehicle gates activation itself so
+    // a stale input can't leak a disabled system. Aero *effects* of DRS /
+    // wing mode are game-computed (VehicleInput aero areas), not engine
+    // formulas — only activation flags live here.
     bool drsEnabled = true;          // classic: DRS on straights
     bool activeAeroEnabled = false;  // 2026: X/Z wing modes (V)
     bool overtakeEnabled = false;    // 2026: manual override deploy (SHIFT)
@@ -450,6 +586,15 @@ struct VehicleInput {
     bool drsZone = false;     // car is inside a map-marked DRS activation zone
     bool wingToggle = false;
     bool overtake = false;
+
+    // Effective aero areas [m^2] after game rules (damage, DRS, wing mode,
+    // pitch balance). Written by the game each substep; the engine only
+    // turns them into forces (q * A) — it never derives them from DRS /
+    // X-Mode / part health. Negative = unset: fall back to VehicleParams
+    // base areas + pitch split (unit tests that skip the game layer).
+    float dragArea = -1.f;
+    float frontDownforceArea = -1.f;
+    float rearDownforceArea = -1.f;
 };
 
 // Chassis rigid body + 4 raycast-suspension wheels + combined-slip tires.
@@ -495,17 +640,8 @@ public:
 private:
     void UpdatePowertrain(const VehicleInput& input, float dt);
     void UpdateWheels(float dt);
-    void UpdateAero(float dt);
     void UpdateAssists(VehicleInput& input);
     void UpdateDamageFromContact(const ContactEvent& event);
-
-    // Aerodynamic coefficients after damage / wing-mode / DRS modulation.
-    struct AeroCoefficients {
-        float dragArea = 1.f;
-        float frontDownforceArea = 1.f;
-        float rearDownforceArea = 1.f;
-    };
-    AeroCoefficients ComputeAero() const;
 
     IPhysicsWorld* world_ = nullptr;
     BodyHandle chassis_ = kInvalidBody;

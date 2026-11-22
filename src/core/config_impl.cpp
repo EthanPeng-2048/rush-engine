@@ -1,60 +1,64 @@
-﻿module;
+module;
+#include <cstdint>
 #include <fstream>
-#include <sstream>
+#include <iterator>
 #include <string>
 #include <unordered_map>
 
+#include <kvrec/kvrecord.hpp>
+
 module rush.engine.core;
-
-
 
 namespace apex {
 
 namespace {
 
-std::string Trim(const std::string& s) {
-    size_t begin = 0;
-    while (begin < s.size() && (s[begin] == ' ' || s[begin] == '\t' || s[begin] == '\r')) ++begin;
-    size_t end = s.size();
-    while (end > begin && (s[end - 1] == ' ' || s[end - 1] == '\t' || s[end - 1] == '\r')) --end;
-    return s.substr(begin, end - begin);
+constexpr std::uint64_t kConfigFormatVersion = 1;
+
+std::string SectionKey(const std::string& section, const std::string& key) {
+    return section.empty() ? key : section + "." + key;
 }
 
 }  // namespace
 
 bool Config::Load(const std::string& path) {
-    std::ifstream file(path);
+    std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) return false;
 
+    const std::string bytes((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+    auto parsed = kvrec::KeyValueRecord::parse(bytes);
+    if (!parsed) return false;
+
     values_.clear();
-    std::string line;
-    std::string section;
-    while (std::getline(file, line)) {
-        line = Trim(line);
-        if (line.empty() || line[0] == ';' || line[0] == '#') continue;
-        if (line.front() == '[' && line.back() == ']') {
-            section = Trim(line.substr(1, line.size() - 2));
-            continue;
+    // Flat dotted keys: "section.key" -> Str. format_version is UInt and skipped.
+    for (const std::string& full : parsed->string_keys_with_prefix("")) {
+        std::string raw;
+        if (!parsed->get(full, raw)) continue;
+        const size_t dot = full.find('.');
+        if (dot == std::string::npos) {
+            values_[""][full] = raw;
+        } else {
+            values_[full.substr(0, dot)][full.substr(dot + 1)] = raw;
         }
-        const size_t eq = line.find('=');
-        if (eq == std::string::npos) continue;
-        values_[section][Trim(line.substr(0, eq))] = Trim(line.substr(eq + 1));
     }
     return true;
 }
 
 bool Config::Save(const std::string& path) const {
-    std::ofstream file(path);
-    if (!file.is_open()) return false;
-
+    kvrec::KeyValueRecord rec;
+    rec.set("format_version", kConfigFormatVersion);
     for (const auto& [section, pairs] : values_) {
-        if (!section.empty()) file << '[' << section << "]\n";
         for (const auto& [key, value] : pairs) {
-            file << key << '=' << value << '\n';
+            rec.set(SectionKey(section, key), value);
         }
-        file << '\n';
     }
-    return true;
+
+    const std::string bytes = rec.serialize_v2();
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) return false;
+    file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    return static_cast<bool>(file);
 }
 
 std::string Config::GetString(const std::string& section, const std::string& key,
@@ -97,4 +101,3 @@ void Config::SetString(const std::string& section, const std::string& key, const
 }
 
 }  // namespace apex
-

@@ -230,71 +230,76 @@ void NudgeWorld::Step(float dt) {
     impl_->prevPairs.swap(currentPairs);
 }
 
-BodyHandle NudgeWorld::CreateBody(const BodyDesc& desc) {
+// Compat adapter: always succeeds (invalid handles → defaults as success).
+rush::Result<BodyHandle> NudgeWorld::CreateBody(const BodyDesc& desc) {
     return impl_->SpawnNudgeBody(impl_->nextHandle++, desc);
 }
 
-void NudgeWorld::DestroyBody(BodyHandle handle) {
+rush::Result<void> NudgeWorld::DestroyBody(BodyHandle handle) {
     const auto it = impl_->bodies.find(handle);
-    if (it == impl_->bodies.end()) return;
+    if (it == impl_->bodies.end()) return {};
     destroy_body(impl_->world, it->second.body);
     impl_->byId.erase(it->second.body.id);
     impl_->bodies.erase(it);
+    return {};
 }
 
-Transform NudgeWorld::GetTransform(BodyHandle handle) const {
+rush::Result<Transform> NudgeWorld::GetTransform(BodyHandle handle) const {
     const auto it = impl_->bodies.find(handle);
-    if (it == impl_->bodies.end()) return {};
+    if (it == impl_->bodies.end()) return Transform{};
     Transform out;
     out.position = FromNudge(body_get_position(impl_->world, it->second.body));
     out.rotation = FromNudgeQuat(body_get_rotation(impl_->world, it->second.body));
     return out;
 }
 
-void NudgeWorld::SetTransform(BodyHandle handle, const Transform& transform) {
+rush::Result<void> NudgeWorld::SetTransform(BodyHandle handle, const Transform& transform) {
     const auto it = impl_->bodies.find(handle);
-    if (it == impl_->bodies.end()) return;
+    if (it == impl_->bodies.end()) return {};
 
     // nudge has no rotation setter — recreate the body at the new pose and
     // keep the handle + velocities (Vehicle::Reset zeroes them right after).
-    const Vec3 v = GetLinearVelocity(handle);
-    const Vec3 w = GetAngularVelocity(handle);
+    const Vec3 v = GetLinearVelocity(handle).value_or(Vec3{});
+    const Vec3 w = GetAngularVelocity(handle).value_or(Vec3{});
     BodyDesc desc = it->second.desc;
     desc.transform = transform;
-    DestroyBody(handle);
+    (void)DestroyBody(handle);
     impl_->SpawnNudgeBody(handle, desc);
-    SetLinearVelocity(handle, v);
-    SetAngularVelocity(handle, w);
+    (void)SetLinearVelocity(handle, v);
+    (void)SetAngularVelocity(handle, w);
+    return {};
 }
 
-Vec3 NudgeWorld::GetLinearVelocity(BodyHandle handle) const {
+rush::Result<Vec3> NudgeWorld::GetLinearVelocity(BodyHandle handle) const {
     const auto it = impl_->bodies.find(handle);
     return it == impl_->bodies.end() ? Vec3{}
                                      : FromNudge(body_get_velocity(impl_->world, it->second.body));
 }
 
-Vec3 NudgeWorld::GetAngularVelocity(BodyHandle handle) const {
+rush::Result<Vec3> NudgeWorld::GetAngularVelocity(BodyHandle handle) const {
     const auto it = impl_->bodies.find(handle);
     return it == impl_->bodies.end()
                ? Vec3{}
                : FromNudge(body_get_angular_velocity(impl_->world, it->second.body));
 }
 
-void NudgeWorld::SetLinearVelocity(BodyHandle handle, const Vec3& velocity) {
+rush::Result<void> NudgeWorld::SetLinearVelocity(BodyHandle handle, const Vec3& velocity) {
     const auto it = impl_->bodies.find(handle);
-    if (it == impl_->bodies.end()) return;
+    if (it == impl_->bodies.end()) return {};
     body_set_velocity(impl_->world, it->second.body, ToNudge(velocity));
     body_wake(impl_->world, it->second.body);
+    return {};
 }
 
-void NudgeWorld::SetAngularVelocity(BodyHandle handle, const Vec3& velocity) {
+rush::Result<void> NudgeWorld::SetAngularVelocity(BodyHandle handle, const Vec3& velocity) {
     const auto it = impl_->bodies.find(handle);
-    if (it == impl_->bodies.end()) return;
+    if (it == impl_->bodies.end()) return {};
     body_set_angular_velocity(impl_->world, it->second.body, ToNudge(velocity));
     body_wake(impl_->world, it->second.body);
+    return {};
 }
 
-Vec3 NudgeWorld::GetVelocityAtPoint(BodyHandle handle, const Vec3& worldPoint) const {
+rush::Result<Vec3> NudgeWorld::GetVelocityAtPoint(BodyHandle handle, const Vec3& worldPoint) const {
     const auto it = impl_->bodies.find(handle);
     if (it == impl_->bodies.end()) return Vec3{};
     const Vec3 v = FromNudge(body_get_velocity(impl_->world, it->second.body));
@@ -303,24 +308,27 @@ Vec3 NudgeWorld::GetVelocityAtPoint(BodyHandle handle, const Vec3& worldPoint) c
     return v + Cross(w, r);
 }
 
-void NudgeWorld::ApplyForce(BodyHandle handle, const Vec3& force, const Vec3& worldPoint) {
+rush::Result<void> NudgeWorld::ApplyForce(BodyHandle handle, const Vec3& force, const Vec3& worldPoint) {
     const auto it = impl_->bodies.find(handle);
-    if (it == impl_->bodies.end() || it->second.desc.mass <= 0.f) return;
+    if (it == impl_->bodies.end() || it->second.desc.mass <= 0.f) return {};
     // Accumulate; torque arm folded in now so point-less force paths stay
     // consistent (Step applies force*dt at the origin linearly).
     it->second.forceAccum += force;
     const Vec3 r = worldPoint - FromNudge(body_get_position(impl_->world, it->second.body));
     it->second.torqueAccum += Cross(r, force);
+    return {};
 }
 
-void NudgeWorld::ApplyImpulse(BodyHandle handle, const Vec3& impulse, const Vec3& worldPoint) {
+rush::Result<void> NudgeWorld::ApplyImpulse(BodyHandle handle, const Vec3& impulse, const Vec3& worldPoint) {
     impl_->ApplyImpulseInternal(handle, impulse, worldPoint);
+    return {};
 }
 
-void NudgeWorld::ApplyTorque(BodyHandle handle, const Vec3& torque) {
+rush::Result<void> NudgeWorld::ApplyTorque(BodyHandle handle, const Vec3& torque) {
     const auto it = impl_->bodies.find(handle);
-    if (it == impl_->bodies.end() || it->second.desc.mass <= 0.f) return;
+    if (it == impl_->bodies.end() || it->second.desc.mass <= 0.f) return {};
     it->second.torqueAccum += torque;
+    return {};
 }
 
 RayHit NudgeWorld::Raycast(const Vec3& origin, const Vec3& direction, float maxDistance,
@@ -349,6 +357,7 @@ RayHit NudgeWorld::Raycast(const Vec3& origin, const Vec3& direction, float maxD
             out.fraction = maxDistance > 1e-6f ? (traveled + hit.distance) / maxDistance : 0.f;
             const auto it = impl_->bodies.find(handle);
             out.userData = it != impl_->bodies.end() ? it->second.desc.userData : nullptr;
+            out.friction = it != impl_->bodies.end() ? it->second.desc.friction : 0.f;
             return out;
         }
         from += dir * advance;
@@ -361,6 +370,30 @@ std::vector<ContactEvent> NudgeWorld::DrainContacts() {
     std::vector<ContactEvent> out;
     CollisionBus().Drain(out);
     return out;
+}
+
+// --- Contact friction: BodyDesc cache + generic mix (no runtime setter) ---
+// nudge has no body_set_friction; mu is fixed at create_body. Queries read
+// the adapter cache (same value the solver got at spawn). SetFriction only
+// updates that cache — see Capabilities().
+PhysicsCapability NudgeWorld::Capabilities() const {
+    return PhysicsCapability::NativeRaycastFriction | PhysicsCapability::NativeContactFriction;
+}
+
+rush::Result<float> NudgeWorld::GetFriction(BodyHandle handle) const {
+    const auto it = impl_->bodies.find(handle);
+    return it != impl_->bodies.end() ? it->second.desc.friction : 0.f;
+}
+
+rush::Result<void> NudgeWorld::SetFriction(BodyHandle handle, float friction) {
+    // Compat: no native runtime setter — cache only (queries/raycast).
+    const auto it = impl_->bodies.find(handle);
+    if (it != impl_->bodies.end()) it->second.desc.friction = friction;
+    return {};
+}
+
+rush::Result<float> NudgeWorld::GetContactFriction(BodyHandle a, BodyHandle b) const {
+    return MixFriction(GetFriction(a).value_or(0.f), GetFriction(b).value_or(0.f));
 }
 
 }  // namespace apex
