@@ -1,11 +1,15 @@
 module;
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdio>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 export module rush.engine.runtime;
 
@@ -100,6 +104,167 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_;
     std::atomic<bool> stop_{false};
+};
+
+// ── Jitter probe ─────────────────────────────────────────────────────────
+// Real-time detector for "car flickers between a recent historical pose and
+// the current pose" (seen at race start). Feed every pose that is published
+// or drawn; on an A/B/history hit, append one line to a log file.
+//
+// Interpretation:
+//   stage=publish hits  → simulation / snapshot content itself jumps
+//   stage=render  hits  → only what is drawn jumps (handoff / dual-source)
+//   both dirty          → upstream state, not just the render path
+//
+// Detection: current sample is far from the previous sample but close to some
+// older sample in a short window (returned to history after a jump).
+// (Already inside `export namespace rush`.)
+
+class JitterProbe {
+public:
+    static constexpr int kWindow = 8;
+    // Jump between consecutive samples that counts as "moved" [m].
+    static constexpr float kJumpMin = 0.12f;
+    // How close to an older sample counts as "back at history" [m].
+    static constexpr float kReturnMax = 0.05f;
+
+    static JitterProbe& Get() {
+        static JitterProbe probe;
+        return probe;
+    }
+
+    void SetEnabled(bool on) {
+        std::lock_guard lock(mutex_);
+        enabled_ = on;
+        if (on && log_ == nullptr) {
+            log_ = std::fopen(logPath_.c_str(), "a");
+            if (log_) {
+                std::fprintf(log_, "# jitter_probe stage car jump return x z prevX prevZ retSlot tSec\n");
+                std::fflush(log_);
+            }
+        }
+        if (!on && log_) {
+            std::fclose(log_);
+            log_ = nullptr;
+        }
+    }
+
+    void SetLogPath(std::string path) {
+        bool reopen = false;
+        {
+            std::lock_guard lock(mutex_);
+            if (log_) {
+                std::fclose(log_);
+                log_ = nullptr;
+            }
+            logPath_ = std::move(path);
+            reopen = enabled_;
+        }
+        if (reopen) SetEnabled(true);
+    }
+
+    [[nodiscard]] bool Enabled() const {
+        std::lock_guard lock(mutex_);
+        return enabled_;
+    }
+
+    [[nodiscard]] long Hits() const {
+        std::lock_guard lock(mutex_);
+        return hits_;
+    }
+
+    // One pose sample. Returns true when a history-return is detected.
+    // thread-safe; stages must not share car indices (publish vs render have
+    // separate histories).
+    bool Observe(const char* stage, int car, float x, float z) {
+        std::lock_guard lock(mutex_);
+        if (!enabled_ || car < 0 || car >= kMaxCars) return false;
+        auto& h = hist_[StageIndex(stage)][car];
+        const float px = h.xs[h.head];
+        const float pz = h.zs[h.head];
+        const bool hasPrev = h.count >= 1;
+        const float now = NowSec();
+
+        float jump = 0.f;
+        float ret = 1e9f;
+        int retSlot = -1;
+        if (hasPrev) {
+            jump = std::sqrt((x - px) * (x - px) + (z - pz) * (z - pz));
+            // Scan older slots (skip the just-about-to-overwrite head after push).
+            for (int i = 1; i < h.count && i < kWindow; ++i) {
+                const int slot = (h.head + kWindow - i) % kWindow;
+                const float dx = x - h.xs[slot];
+                const float dz = z - h.zs[slot];
+                const float d = std::sqrt(dx * dx + dz * dz);
+                if (d < ret) {
+                    ret = d;
+                    retSlot = i;
+                }
+            }
+        }
+
+        // Push current.
+        h.head = (h.head + 1) % kWindow;
+        h.xs[h.head] = x;
+        h.zs[h.head] = z;
+        if (h.count < kWindow) ++h.count;
+
+        // retSlot>=1: matched a sample that is not the immediate previous
+        // (i=0 would be previous; we start at i=1). Classic A-B-A is retSlot=1.
+        const bool hit = hasPrev && jump >= kJumpMin && ret <= kReturnMax && retSlot >= 1;
+        if (hit) {
+            ++hits_;
+            if (log_) {
+                std::fprintf(log_, "%s %d %.4f %.4f %.3f %.3f %.3f %.3f %d %.6f\n", stage, car,
+                             jump, ret, x, z, px, pz, retSlot, now);
+                std::fflush(log_);
+            }
+        }
+        return hit;
+    }
+
+    void ResetHistories() {
+        std::lock_guard lock(mutex_);
+        for (auto& stage : hist_) {
+            for (auto& h : stage) {
+                h = Hist{};
+            }
+        }
+        hits_ = 0;
+    }
+
+private:
+    JitterProbe() = default;
+    ~JitterProbe() {
+        if (log_) std::fclose(log_);
+    }
+
+    static int StageIndex(const char* stage) {
+        return stage && stage[0] == 'r' ? 1 : 0;  // "render" → 1, else publish
+    }
+
+    static float NowSec() {
+        using clock = std::chrono::steady_clock;
+        static const clock::time_point t0 = clock::now();
+        return std::chrono::duration<float>(clock::now() - t0).count();
+    }
+
+    struct Hist {
+        float xs[kWindow] = {};
+        float zs[kWindow] = {};
+        int head = 0;
+        int count = 0;
+    };
+
+    static constexpr int kMaxCars = 128;
+    static constexpr int kStages = 2;  // 0=publish, 1=render
+
+    mutable std::mutex mutex_;
+    bool enabled_ = false;
+    long hits_ = 0;
+    std::string logPath_ = "jitter_probe.log";
+    std::FILE* log_ = nullptr;
+    Hist hist_[kStages][kMaxCars] = {};
 };
 
 }  // namespace rush
