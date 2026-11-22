@@ -107,26 +107,27 @@ private:
 };
 
 // ── Jitter probe ─────────────────────────────────────────────────────────
-// Real-time detector for "car flickers between a recent historical pose and
-// the current pose" (seen at race start). Feed every pose that is published
-// or drawn; on an A/B/history hit, append one line to a log file.
+// Detects "car flickers between a recent historical pose and the current
+// pose" (and related visual pops). Feed publish + render poses; optional
+// dense player trace for offline inspection when hits are ambiguous.
 //
-// Interpretation:
-//   stage=publish hits  → simulation / snapshot content itself jumps
-//   stage=render  hits  → only what is drawn jumps (handoff / dual-source)
-//   both dirty          → upstream state, not just the render path
+// stage=publish hits → simulation / snapshot content jumps
+// stage=render  hits → only what is drawn jumps (handoff / dual-source)
 //
-// Detection: current sample is far from the previous sample but close to some
-// older sample in a short window (returned to history after a jump).
+// Detection (any of):
+//   1) return-to-history: |p - older| small while |p - prev| large
+//   2) reverse step: consecutive deltas oppose (zigzag) above threshold
+//   3) angular snap: quaternion far from previous (body spin pop)
+// Distances are full 3D (x,y,z) — x/z alone misses suspension pops.
 // (Already inside `export namespace rush`.)
 
 class JitterProbe {
 public:
-    static constexpr int kWindow = 8;
-    // Jump between consecutive samples that counts as "moved" [m].
-    static constexpr float kJumpMin = 0.12f;
-    // How close to an older sample counts as "back at history" [m].
-    static constexpr float kReturnMax = 0.05f;
+    static constexpr int kWindow = 32;  // "a few frames ago" at 60–120 Hz
+    static constexpr float kJumpMin = 0.03f;    // 3 cm — sub-metre flicker
+    static constexpr float kReturnMax = 0.06f;  // within 6 cm of history
+    static constexpr float kReverseMin = 0.025f;
+    static constexpr float kQuatDotMin = 0.985f;  // ~10°+ snap between frames
 
     static JitterProbe& Get() {
         static JitterProbe probe;
@@ -139,7 +140,9 @@ public:
         if (on && log_ == nullptr) {
             log_ = std::fopen(logPath_.c_str(), "a");
             if (log_) {
-                std::fprintf(log_, "# jitter_probe stage car jump return x z prevX prevZ retSlot tSec\n");
+                std::fprintf(log_,
+                             "# jitter hit|trace stage car kind jump ret reverse "
+                             "quatDot x y z prevX prevY prevZ tSec\n");
                 std::fflush(log_);
             }
         }
@@ -173,54 +176,109 @@ public:
         return hits_;
     }
 
-    // One pose sample. Returns true when a history-return is detected.
-    // thread-safe; stages must not share car indices (publish vs render have
-    // separate histories).
-    bool Observe(const char* stage, int car, float x, float z) {
+    // Pose sample with optional rotation (pass identity quat to skip ang check).
+    bool Observe(const char* stage, int car, float x, float y, float z, float qx = 0.f,
+                 float qy = 0.f, float qz = 0.f, float qw = 1.f) {
         std::lock_guard lock(mutex_);
         if (!enabled_ || car < 0 || car >= kMaxCars) return false;
         auto& h = hist_[StageIndex(stage)][car];
-        const float px = h.xs[h.head];
-        const float pz = h.zs[h.head];
         const bool hasPrev = h.count >= 1;
         const float now = NowSec();
 
         float jump = 0.f;
         float ret = 1e9f;
         int retSlot = -1;
+        float reverse = 0.f;
+        float quatDot = 1.f;
+        const char* kind = nullptr;
+
         if (hasPrev) {
-            jump = std::sqrt((x - px) * (x - px) + (z - pz) * (z - pz));
-            // Scan older slots (skip the just-about-to-overwrite head after push).
+            const float dx = x - h.xs[h.head];
+            const float dy = y - h.ys[h.head];
+            const float dz = z - h.zs[h.head];
+            jump = std::sqrt(dx * dx + dy * dy + dz * dz);
+
             for (int i = 1; i < h.count && i < kWindow; ++i) {
                 const int slot = (h.head + kWindow - i) % kWindow;
-                const float dx = x - h.xs[slot];
-                const float dz = z - h.zs[slot];
-                const float d = std::sqrt(dx * dx + dz * dz);
+                const float ex = x - h.xs[slot];
+                const float ey = y - h.ys[slot];
+                const float ez = z - h.zs[slot];
+                const float d = std::sqrt(ex * ex + ey * ey + ez * ez);
                 if (d < ret) {
                     ret = d;
                     retSlot = i;
                 }
             }
+
+            // Reverse / zigzag: current step opposes previous step.
+            if (h.count >= 2) {
+                const int prevSlot = (h.head + kWindow - 1) % kWindow;
+                const float px = h.xs[h.head] - h.xs[prevSlot];
+                const float py = h.ys[h.head] - h.ys[prevSlot];
+                const float pz = h.zs[h.head] - h.zs[prevSlot];
+                const float plen = std::sqrt(px * px + py * py + pz * pz);
+                const float clen = jump;
+                if (plen >= kReverseMin && clen >= kReverseMin) {
+                    const float dot = (dx * px + dy * py + dz * pz) / (plen * clen);
+                    reverse = dot;  // <0 = opposing
+                }
+            }
+
+            // Angular snap (only if caller supplied a real quat path: qw may be 1 default).
+            const bool hasQuat = !(qx == 0.f && qy == 0.f && qz == 0.f && qw == 1.f) ||
+                                 h.hasQuat;
+            if (h.hasQuat && hasQuat) {
+                quatDot = std::fabs(qx * h.qx[h.head] + qy * h.qy[h.head] + qz * h.qz[h.head] +
+                                    qw * h.qw[h.head]);
+            }
         }
+
+        // Classify hit.
+        const bool hitReturn = hasPrev && jump >= kJumpMin && ret <= kReturnMax && retSlot >= 1;
+        const bool hitReverse =
+            hasPrev && reverse < -0.5f && jump >= kReverseMin && ret > kReturnMax;
+        const bool hitQuat = hasPrev && h.hasQuat && quatDot < kQuatDotMin && jump < kJumpMin;
+        if (hitReturn) kind = "return";
+        else if (hitReverse) kind = "reverse";
+        else if (hitQuat) kind = "quat";
+        const bool hit = kind != nullptr;
 
         // Push current.
         h.head = (h.head + 1) % kWindow;
         h.xs[h.head] = x;
+        h.ys[h.head] = y;
         h.zs[h.head] = z;
+        h.qx[h.head] = qx;
+        h.qy[h.head] = qy;
+        h.qz[h.head] = qz;
+        h.qw[h.head] = qw;
+        h.hasQuat = h.hasQuat || !(qx == 0.f && qy == 0.f && qz == 0.f && qw == 1.f);
         if (h.count < kWindow) ++h.count;
 
-        // retSlot>=1: matched a sample that is not the immediate previous
-        // (i=0 would be previous; we start at i=1). Classic A-B-A is retSlot=1.
-        const bool hit = hasPrev && jump >= kJumpMin && ret <= kReturnMax && retSlot >= 1;
         if (hit) {
             ++hits_;
             if (log_) {
-                std::fprintf(log_, "%s %d %.4f %.4f %.3f %.3f %.3f %.3f %d %.6f\n", stage, car,
-                             jump, ret, x, z, px, pz, retSlot, now);
+                std::fprintf(log_,
+                             "hit %s %d %s %.4f %.4f %.3f %.4f %.3f %.3f %.3f %.3f %.3f %.3f %.6f\n",
+                             stage, car, kind, jump, ret, reverse, quatDot, x, y, z,
+                             h.xs[(h.head + kWindow - 1) % kWindow],
+                             h.ys[(h.head + kWindow - 1) % kWindow],
+                             h.zs[(h.head + kWindow - 1) % kWindow], now);
                 std::fflush(log_);
             }
         }
         return hit;
+    }
+
+    // Dense per-frame line for one subject (player / camera). Always safe to
+    // call when enabled; use for offline zoom on a visual flash.
+    void Trace(const char* tag, float x, float y, float z) {
+        std::lock_guard lock(mutex_);
+        if (!enabled_ || !log_) return;
+        std::fprintf(log_, "trace %s 0 - 0 0 0 0 %.4f %.4f %.4f 0 0 0 %.6f\n", tag, x, y, z,
+                     NowSec());
+        // Flush occasionally to keep the file useful if the process dies.
+        if ((traceSeq_++ % 30) == 0) std::fflush(log_);
     }
 
     void ResetHistories() {
@@ -231,6 +289,7 @@ public:
             }
         }
         hits_ = 0;
+        traceSeq_ = 0;
     }
 
 private:
@@ -240,7 +299,7 @@ private:
     }
 
     static int StageIndex(const char* stage) {
-        return stage && stage[0] == 'r' ? 1 : 0;  // "render" → 1, else publish
+        return stage && stage[0] == 'r' ? 1 : 0;
     }
 
     static float NowSec() {
@@ -251,17 +310,24 @@ private:
 
     struct Hist {
         float xs[kWindow] = {};
+        float ys[kWindow] = {};
         float zs[kWindow] = {};
+        float qx[kWindow] = {};
+        float qy[kWindow] = {};
+        float qz[kWindow] = {};
+        float qw[kWindow] = {};
         int head = 0;
         int count = 0;
+        bool hasQuat = false;
     };
 
     static constexpr int kMaxCars = 128;
-    static constexpr int kStages = 2;  // 0=publish, 1=render
+    static constexpr int kStages = 2;
 
     mutable std::mutex mutex_;
     bool enabled_ = false;
     long hits_ = 0;
+    long traceSeq_ = 0;
     std::string logPath_ = "jitter_probe.log";
     std::FILE* log_ = nullptr;
     Hist hist_[kStages][kMaxCars] = {};
