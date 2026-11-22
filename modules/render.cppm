@@ -58,6 +58,19 @@ struct MeshData {
 using MeshHandle = uint32_t;
 constexpr MeshHandle kInvalidMesh = 0;
 
+// CPU-side RGBA8 texture pixels handed to IRenderer::CreateTexture. The
+// backend copies the data immediately, so the caller may free `pixels` after
+// the call returns. Rows are top to bottom (origin = top-left), matching the
+// UV convention (v=0 at the top of the texture).
+struct TextureData {
+    int width = 0;
+    int height = 0;
+    const uint8_t* pixels = nullptr;
+};
+
+using TextureHandle = uint32_t;
+constexpr TextureHandle kInvalidTexture = 0;
+
 // Unified render interface. The game layer only talks to this, so the
 // backend (raylib today, something else later) is replaceable.
 // Input lives in rush.engine.input — this interface is render-only.
@@ -85,11 +98,20 @@ public:
 
     virtual MeshHandle CreateMesh(const MeshData& data) = 0;
     virtual void DestroyMesh(MeshHandle handle) = 0;
-    virtual void DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint) = 0;
+    // Draw a mesh. When `texture` is set, the mesh's albedo is sampled from it
+    // and a lit material is applied (diffuse + specular); when it is
+    // kInvalidTexture the mesh falls back to the unlit vertex-color path.
+    virtual void DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint,
+                          TextureHandle texture = kInvalidTexture) = 0;
     // Cheap quality-option shadow: squashes the mesh onto the ground plane at
     // groundY (top-down footprint) and draws it translucent dark.
     virtual void DrawMeshShadow(MeshHandle handle, const Transform& transform, float groundY,
                                 const Color& tint) = 0;
+
+    // Upload CPU RGBA8 pixels as a GPU texture; the backend copies the data.
+    // Returns kInvalidTexture on failure.
+    virtual TextureHandle CreateTexture(const TextureData& data) = 0;
+    virtual void DestroyTexture(TextureHandle handle) = 0;
 
     // Immediate primitives for debugging, HUD and low-poly bodies.
     virtual void DrawBox(const Vec3& halfExtents, const Transform& transform, const Color& color) = 0;
@@ -131,9 +153,12 @@ public:
     bool ShadowsEnabled() const override;
     MeshHandle CreateMesh(const MeshData& data) override;
     void DestroyMesh(MeshHandle handle) override;
-    void DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint) override;
+    void DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint,
+                  TextureHandle texture = kInvalidTexture) override;
     void DrawMeshShadow(MeshHandle handle, const Transform& transform, float groundY,
                         const Color& tint) override;
+    TextureHandle CreateTexture(const TextureData& data) override;
+    void DestroyTexture(TextureHandle handle) override;
     void DrawBox(const Vec3& halfExtents, const Transform& transform, const Color& color) override;
     void DrawLine3D(const Vec3& start, const Vec3& end, const Color& color) override;
     void DrawGrid(int slices, float spacing) override;
@@ -154,6 +179,7 @@ private:
         MeshHandle mesh = kInvalidMesh;
         Transform transform;
         Color tint;
+        TextureHandle texture = kInvalidTexture;
     };
 
     int width_ = 1280;
@@ -161,7 +187,14 @@ private:
     VideoConfig video_;
     double time_ = 0.0;
     MeshHandle nextMesh_ = 1;
+    TextureHandle nextTexture_ = 1;
     std::unordered_map<MeshHandle, MeshData> meshes_;
+    struct OwnedTexture {
+        int width = 0;
+        int height = 0;
+        std::vector<uint8_t> pixels;  // RGBA8 copy (backend owns it)
+    };
+    std::unordered_map<TextureHandle, OwnedTexture> textures_;
     std::vector<DrawCmd> draws_;
     bool closeRequested_ = false;
 };
@@ -190,9 +223,12 @@ public:
     bool ShadowsEnabled() const override;
     MeshHandle CreateMesh(const MeshData& data) override;
     void DestroyMesh(MeshHandle handle) override;
-    void DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint) override;
+    void DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint,
+                  TextureHandle texture = kInvalidTexture) override;
     void DrawMeshShadow(MeshHandle handle, const Transform& transform, float groundY,
                         const Color& tint) override;
+    TextureHandle CreateTexture(const TextureData& data) override;
+    void DestroyTexture(TextureHandle handle) override;
     void DrawBox(const Vec3& halfExtents, const Transform& transform, const Color& color) override;
     void DrawLine3D(const Vec3& start, const Vec3& end, const Color& color) override;
     void DrawGrid(int slices, float spacing) override;

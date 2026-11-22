@@ -5,6 +5,7 @@ module;
 #include <vector>
 #include <cstdint>
 #include "raylib.h"
+#include "rlgl.h"
 
 module rush.engine.render;
 import rush.engine.core;
@@ -12,6 +13,119 @@ import rush.engine.core;
 namespace apex {
 
 namespace {
+
+// Simple lit material for textured meshes. raylib's default shader is unlit
+// (vertex color * texture color), which is why meshes looked flat; this shader
+// adds a directional key light plus a specular term so paint reads like paint.
+// We embed two GLSL variants because desktop raylib is OpenGL 3.3 and the
+// emscripten build is WebGL2 (GLES 3.0). raylib binds the standard attribute
+// and uniform names (vertexPosition, matModel, colDiffuse, texture0, mvp).
+#if defined(__EMSCRIPTEN__)
+constexpr const char* kLitVert = R"GLSL(
+#version 300 es
+precision highp float;
+in vec3 vertexPosition;
+in vec2 vertexTexCoord;
+in vec3 vertexNormal;
+in vec4 vertexColor;
+uniform mat4 mvp;
+uniform mat4 matModel;
+out vec2 fragTexCoord;
+out vec3 fragNormal;
+out vec3 fragPos;
+out vec4 fragColor;
+void main() {
+    fragTexCoord = vertexTexCoord;
+    fragColor = vertexColor;
+    mat3 normalMatrix = mat3(matModel);
+    fragNormal = normalize(normalMatrix * vertexNormal);
+    fragPos = (matModel * vec4(vertexPosition, 1.0)).xyz;
+    gl_Position = mvp * vec4(vertexPosition, 1.0);
+}
+)GLSL";
+constexpr const char* kLitFrag = R"GLSL(
+#version 300 es
+precision highp float;
+in vec2 fragTexCoord;
+in vec3 fragNormal;
+in vec3 fragPos;
+in vec4 fragColor;
+uniform sampler2D texture0;
+uniform vec4 colDiffuse;
+uniform vec3 viewPos;
+uniform vec3 lightDir;
+uniform vec3 lightColor;
+uniform float lightIntensity;
+out vec4 finalColor;
+void main() {
+    vec4 texColor = texture(texture0, fragTexCoord) * fragColor * colDiffuse;
+    vec3 N = normalize(fragNormal);
+    vec3 L = normalize(lightDir);
+    float diff = max(dot(N, L), 0.0);
+    vec3 V = normalize(viewPos - fragPos);
+    vec3 H = normalize(L + V);
+    float spec = pow(max(dot(N, H), 0.0), 40.0);
+    vec3 ambient = vec3(0.30, 0.33, 0.37);
+    vec3 lighting = ambient + diff * lightColor * lightIntensity;
+    vec3 color = texColor.rgb * lighting + spec * lightColor * lightIntensity * 0.5;
+    finalColor = vec4(color, texColor.a);
+}
+)GLSL";
+#else
+constexpr const char* kLitVert = R"GLSL(
+#version 330
+in vec3 vertexPosition;
+in vec2 vertexTexCoord;
+in vec3 vertexNormal;
+in vec4 vertexColor;
+uniform mat4 mvp;
+uniform mat4 matModel;
+out vec2 fragTexCoord;
+out vec3 fragNormal;
+out vec3 fragPos;
+out vec4 fragColor;
+void main() {
+    fragTexCoord = vertexTexCoord;
+    fragColor = vertexColor;
+    mat3 normalMatrix = mat3(matModel);
+    fragNormal = normalize(normalMatrix * vertexNormal);
+    fragPos = (matModel * vec4(vertexPosition, 1.0)).xyz;
+    gl_Position = mvp * vec4(vertexPosition, 1.0);
+}
+)GLSL";
+constexpr const char* kLitFrag = R"GLSL(
+#version 330
+in vec2 fragTexCoord;
+in vec3 fragNormal;
+in vec3 fragPos;
+in vec4 fragColor;
+uniform sampler2D texture0;
+uniform vec4 colDiffuse;
+uniform vec3 viewPos;
+uniform vec3 lightDir;
+uniform vec3 lightColor;
+uniform float lightIntensity;
+out vec4 finalColor;
+void main() {
+    vec4 texColor = texture(texture0, fragTexCoord) * fragColor * colDiffuse;
+    vec3 N = normalize(fragNormal);
+    vec3 L = normalize(lightDir);
+    float diff = max(dot(N, L), 0.0);
+    vec3 V = normalize(viewPos - fragPos);
+    vec3 H = normalize(L + V);
+    float spec = pow(max(dot(N, H), 0.0), 40.0);
+    vec3 ambient = vec3(0.30, 0.33, 0.37);
+    vec3 lighting = ambient + diff * lightColor * lightIntensity;
+    vec3 color = texColor.rgb * lighting + spec * lightColor * lightIntensity * 0.5;
+    finalColor = vec4(color, texColor.a);
+}
+)GLSL";
+#endif
+
+// Directional key light shared by all lit materials (soft afternoon sun).
+constexpr float kLightDir[3] = {0.45f, 0.8f, 0.35f};   // direction light travels
+constexpr float kLightColor[3] = {1.0f, 0.97f, 0.92f};
+constexpr float kLightIntensity = 0.95f;
 
 ::Color ToRaylib(const Color& c) {
     return {static_cast<unsigned char>(Clampf(c.r, 0.f, 1.f) * 255.f),
@@ -51,7 +165,11 @@ struct RaylibBackend::Impl {
     ::Camera3D camera{};
     std::unordered_map<MeshHandle, ::Mesh> meshes;
     std::unordered_map<MeshHandle, ::Model> models;
+    std::unordered_map<TextureHandle, ::Texture2D> textures;
     MeshHandle nextMesh = 1;
+    TextureHandle nextTexture = 1;
+    ::Shader litShader{};
+    int litViewPosLoc = -1;
     bool shadows = true;
 };
 
@@ -86,6 +204,10 @@ bool RaylibBackend::Init(int width, int height, const std::string& title) {
     impl_->camera.up = {0.f, 1.f, 0.f};
     impl_->camera.fovy = 50.f;
     impl_->camera.projection = CAMERA_PERSPECTIVE;
+    // Lit material used by textured meshes; built once and shared. Loaded from
+    // embedded GLSL so no shader files must ship (Web + desktop).
+    impl_->litShader = LoadShaderFromMemory(kLitVert, kLitFrag);
+    impl_->litViewPosLoc = GetShaderLocation(impl_->litShader, "viewPos");
     return true;
 }
 
@@ -99,6 +221,9 @@ void RaylibBackend::Shutdown() {
         if (impl_->models.find(handle) == impl_->models.end()) UnloadMesh(mesh);
     }
     impl_->meshes.clear();
+    for (auto& [handle, texture] : impl_->textures) UnloadTexture(texture);
+    impl_->textures.clear();
+    if (impl_->litShader.id != 0) UnloadShader(impl_->litShader);
     delete impl_;
     impl_ = nullptr;
     if (IsWindowReady()) CloseWindow();
@@ -116,6 +241,21 @@ void RaylibBackend::BeginFrame() {
 
 void RaylibBackend::BeginScene() {
     ::BeginMode3D(impl_->camera);
+    // Push the shared lit-material uniforms for this frame. SetShaderValue
+    // writes to the currently-bound program, so bind the lit shader first; the
+    // values persist on the program and DrawMesh's textured path reuses them.
+    if (impl_->litShader.id != 0) {
+        ::BeginShaderMode(impl_->litShader);
+        const ::Vector3 camPos = impl_->camera.position;
+        SetShaderValue(impl_->litShader, impl_->litViewPosLoc, &camPos, SHADER_UNIFORM_VEC3);
+        SetShaderValue(impl_->litShader, GetShaderLocation(impl_->litShader, "lightDir"),
+                       &kLightDir[0], SHADER_UNIFORM_VEC3);
+        SetShaderValue(impl_->litShader, GetShaderLocation(impl_->litShader, "lightColor"),
+                       &kLightColor[0], SHADER_UNIFORM_VEC3);
+        SetShaderValue(impl_->litShader, GetShaderLocation(impl_->litShader, "lightIntensity"),
+                       &kLightIntensity, SHADER_UNIFORM_FLOAT);
+        ::EndShaderMode();
+    }
 }
 
 void RaylibBackend::EndScene() {
@@ -210,7 +350,30 @@ void RaylibBackend::DestroyMesh(MeshHandle handle) {
     impl_->models.erase(it);
 }
 
-void RaylibBackend::DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint) {
+TextureHandle RaylibBackend::CreateTexture(const TextureData& data) {
+    if (!impl_ || !data.pixels || data.width <= 0 || data.height <= 0) return kInvalidTexture;
+    ::Image img{};
+    img.data = const_cast<unsigned char*>(data.pixels);
+    img.width = data.width;
+    img.height = data.height;
+    img.mipmaps = 1;
+    img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    const ::Texture2D tex = LoadTextureFromImage(img);
+    if (tex.id == 0) return kInvalidTexture;
+    const TextureHandle handle = impl_->nextTexture++;
+    impl_->textures[handle] = tex;
+    return handle;
+}
+
+void RaylibBackend::DestroyTexture(TextureHandle handle) {
+    const auto it = impl_->textures.find(handle);
+    if (it == impl_->textures.end()) return;
+    UnloadTexture(it->second);
+    impl_->textures.erase(it);
+}
+
+void RaylibBackend::DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint,
+                             TextureHandle texture) {
     const auto it = impl_->models.find(handle);
     if (it == impl_->models.end()) return;
     ::Model& model = it->second;
@@ -224,7 +387,26 @@ void RaylibBackend::DrawMesh(MeshHandle handle, const Transform& transform, cons
                        m[4], m[5], m[6],  m[7],
                        m[8], m[9], m[10], m[11],
                        m[12], m[13], m[14], m[15]};
+
+    // Textured meshes use the shared lit material (diffuse + specular); the
+    // default material is unlit. Restore the prior material so the model stays
+    // reusable for both paths (e.g. the squashed shadow draw).
+    const ::Shader prevShader = model.materials[0].shader;
+    const ::Texture2D prevTex = model.materials[0].maps[MATERIAL_MAP_ALBEDO].texture;
+    bool switched = false;
+    if (texture != kInvalidTexture) {
+        const auto tit = impl_->textures.find(texture);
+        if (tit != impl_->textures.end() && impl_->litShader.id != 0) {
+            model.materials[0].shader = impl_->litShader;
+            model.materials[0].maps[MATERIAL_MAP_ALBEDO].texture = tit->second;
+            switched = true;
+        }
+    }
     DrawModel(model, {0.f, 0.f, 0.f}, 1.f, ToRaylib(tint));
+    if (switched) {
+        model.materials[0].shader = prevShader;
+        model.materials[0].maps[MATERIAL_MAP_ALBEDO].texture = prevTex;
+    }
     // Restore identity so the next frame's transform starts clean.
     model.transform = {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f,
                        0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f};

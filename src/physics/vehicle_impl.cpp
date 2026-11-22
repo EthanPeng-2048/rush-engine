@@ -169,6 +169,7 @@ const WheelDraw kWheelDraws[4] = {
 struct ModelCache {
     MeshHandle body = kInvalidMesh;
     MeshHandle wheel = kInvalidMesh;
+    TextureHandle livery = kInvalidTexture;
 };
 
 ModelCache& GetModelCache() {
@@ -187,6 +188,7 @@ MeshData BlobToMesh(const car_model::MeshBlob& blob, float scale = 1.f) {
         data.normals[static_cast<size_t>(i)] = {blob.normals[i * 3 + 0], blob.normals[i * 3 + 1],
                                                 blob.normals[i * 3 + 2]};
     }
+    data.uvs.assign(blob.uvs, blob.uvs + blob.vertexCount * 2);
     data.colors.assign(blob.colors, blob.colors + blob.vertexCount * 4);
     data.indices.assign(blob.indices, blob.indices + blob.indexCount);
     return data;
@@ -196,6 +198,13 @@ void EnsureModel(IRenderer& renderer) {
     ModelCache& cache = GetModelCache();
     if (cache.body == kInvalidMesh) cache.body = renderer.CreateMesh(BlobToMesh(car_model::kBody, kBodyScale));
     if (cache.wheel == kInvalidMesh) cache.wheel = renderer.CreateMesh(BlobToMesh(car_model::kWheel));
+    if (cache.livery == kInvalidTexture) {
+        TextureData tex;
+        tex.width = car_model::kLiveryWidth;
+        tex.height = car_model::kLiveryHeight;
+        tex.pixels = car_model::kLiveryTexture;
+        cache.livery = renderer.CreateTexture(tex);
+    }
 }
 
 }  // namespace
@@ -844,7 +853,7 @@ void Vehicle::RenderPose(IRenderer& renderer, const Transform& transform,
         }
     }
 
-    renderer.DrawMesh(cache.body, bodyT, tint);
+    renderer.DrawMesh(cache.body, bodyT, tint, cache.livery);
 
     // Wheels follow the suspension in Y, steer around up (front) and spin
     // around their axle. Anchor X/Z come from the model so the wheels stay in
@@ -864,7 +873,7 @@ void Vehicle::RenderPose(IRenderer& renderer, const Transform& transform,
         t.position = TransformPoint(transform, Vec3{draw.anchorX, -suspLen, draw.anchorZ});
         t.rotation = rot;
         const float wearTint = 1.f - wheel.wear * 0.45f;
-        renderer.DrawMesh(cache.wheel, t, Color{0.45f, 0.45f, 0.48f, wearTint});
+        renderer.DrawMesh(cache.wheel, t, Color{0.45f, 0.45f, 0.48f, wearTint}, cache.livery);
     }
 }
 

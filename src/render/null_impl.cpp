@@ -16,7 +16,10 @@ bool NullBackend::Init(int width, int height, const std::string&) {
     return true;
 }
 
-void NullBackend::Shutdown() { meshes_.clear(); }
+void NullBackend::Shutdown() {
+    meshes_.clear();
+    textures_.clear();
+}
 
 bool NullBackend::ShouldClose() const { return closeRequested_; }
 
@@ -44,8 +47,22 @@ MeshHandle NullBackend::CreateMesh(const MeshData& data) {
 
 void NullBackend::DestroyMesh(MeshHandle handle) { meshes_.erase(handle); }
 
-void NullBackend::DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint) {
-    if (captureDraws) draws_.push_back({handle, transform, tint});
+TextureHandle NullBackend::CreateTexture(const TextureData& data) {
+    if (!data.pixels || data.width <= 0 || data.height <= 0) return kInvalidTexture;
+    const TextureHandle handle = nextTexture_++;
+    OwnedTexture& tex = textures_[handle];
+    tex.width = data.width;
+    tex.height = data.height;
+    const size_t n = static_cast<size_t>(data.width) * static_cast<size_t>(data.height) * 4;
+    tex.pixels.assign(data.pixels, data.pixels + n);
+    return handle;
+}
+
+void NullBackend::DestroyTexture(TextureHandle handle) { textures_.erase(handle); }
+
+void NullBackend::DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint,
+                           TextureHandle texture) {
+    if (captureDraws) draws_.push_back({handle, transform, tint, texture});
 }
 void NullBackend::DrawMeshShadow(MeshHandle, const Transform&, float, const Color&) {
     // Not captured: shadows would pollute the scene dump.
@@ -74,9 +91,25 @@ void NullBackend::DumpObj(const std::string& path) const {
         if (it == meshes_.end()) continue;
         const MeshData& mesh = it->second;
         std::fprintf(f, "g draw%zu\n# tint %.3f %.3f %.3f\n", d, cmd.tint.r, cmd.tint.g, cmd.tint.b);
+        const auto texIt = cmd.texture != kInvalidTexture ? textures_.find(cmd.texture)
+                                                          : textures_.end();
         for (size_t v = 0; v < mesh.positions.size(); ++v) {
             const Vec3 w = Rotate(cmd.transform.rotation, mesh.positions[v]) + cmd.transform.position;
-            if (!mesh.colors.empty()) {
+            if (texIt != textures_.end() && !mesh.uvs.empty()) {
+                // Sample the baked livery so the OBJ dump shows the real paint.
+                const OwnedTexture& tex = texIt->second;
+                const float u = mesh.uvs[v * 2], vv = mesh.uvs[v * 2 + 1];
+                int x = static_cast<int>(u * tex.width) % tex.width;
+                int y = static_cast<int>(vv * tex.height) % tex.height;
+                if (x < 0) x += tex.width;
+                if (y < 0) y += tex.height;
+                const size_t ci = (static_cast<size_t>(y) * tex.width + x) * 4;
+                const float tr = tex.pixels[ci] / 255.f;
+                const float tg = tex.pixels[ci + 1] / 255.f;
+                const float tb = tex.pixels[ci + 2] / 255.f;
+                std::fprintf(f, "v %.4f %.4f %.4f %.3f %.3f %.3f\n", w.x, w.y, w.z,
+                             tr * cmd.tint.r, tg * cmd.tint.g, tb * cmd.tint.b);
+            } else if (!mesh.colors.empty()) {
                 const size_t ci = v * 4;
                 std::fprintf(f, "v %.4f %.4f %.4f %.3f %.3f %.3f\n", w.x, w.y, w.z,
                              mesh.colors[ci] / 255.f, mesh.colors[ci + 1] / 255.f,
