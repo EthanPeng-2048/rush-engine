@@ -136,6 +136,12 @@ inline float Signf(float v) { return v >= 0.f ? 1.f : -1.f; }
 // Section/key API is unchanged for game code; storage is KVRec under the hood.
 class Config {
 public:
+    // Test/automation mode: Load() and Save() become no-ops so CLI automation
+    // (--drive-test / --bench / QA shots / --dump-scene) never reads or writes
+    // the user's config.rushconf. Off by default — normal play persists as
+    // usual. Set once at startup before any Load/Save.
+    static void SetTestMode(bool on);
+
     bool Load(const std::string& path);
     bool Save(const std::string& path) const;
 

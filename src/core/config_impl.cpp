@@ -15,13 +15,22 @@ namespace {
 
 constexpr std::uint64_t kConfigFormatVersion = 1;
 
+// Set via Config::SetTestMode — automation must never touch config.rushconf.
+bool g_testMode = false;
+
 std::string SectionKey(const std::string& section, const std::string& key) {
     return section.empty() ? key : section + "." + key;
 }
 
 }  // namespace
 
+void Config::SetTestMode(bool on) {
+    g_testMode = on;
+}
+
 bool Config::Load(const std::string& path) {
+    if (g_testMode) return false;  // test mode: never read config files
+
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) return false;
 
@@ -46,6 +55,8 @@ bool Config::Load(const std::string& path) {
 }
 
 bool Config::Save(const std::string& path) const {
+    if (g_testMode) return true;  // test mode: never write config files
+
     kvrec::KeyValueRecord rec;
     rec.set("format_version", kConfigFormatVersion);
     for (const auto& [section, pairs] : values_) {
