@@ -234,7 +234,11 @@ public:
         }
 
         // Classify hit.
-        const bool hitReturn = hasPrev && jump >= kJumpMin && ret <= kReturnMax && retSlot >= 1;
+        // Strict return: must be much closer to history than to prev —
+        // otherwise closed-circuit self-proximity (pass same point 0.5s
+        // later) floods the log (observed: 155/159 false positives).
+        const bool hitReturn = hasPrev && jump >= kJumpMin && ret <= kReturnMax &&
+                               ret <= 0.45f * jump && retSlot >= 1;
         const bool hitReverse =
             hasPrev && reverse < -0.5f && jump >= kReverseMin && ret > kReturnMax;
         const bool hitQuat = hasPrev && h.hasQuat && quatDot < kQuatDotMin && jump < kJumpMin;
