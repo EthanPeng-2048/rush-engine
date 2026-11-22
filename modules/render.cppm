@@ -1,4 +1,4 @@
-﻿module;
+module;
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -60,6 +60,7 @@ constexpr MeshHandle kInvalidMesh = 0;
 
 // Unified render interface. The game layer only talks to this, so the
 // backend (raylib today, something else later) is replaceable.
+// Input lives in rush.engine.input — this interface is render-only.
 class IRenderer {
 public:
     virtual ~IRenderer() = default;
@@ -104,58 +105,18 @@ public:
     virtual void CaptureScreenshot(const std::string& path) = 0;
 };
 
-// Input state sampled once per frame. Kept separate from IRenderer so a
-// dedicated input backend can replace it without touching rendering.
-struct InputState {
-    float throttle = 0.f;      // 0..1
-    float brake = 0.f;         // 0..1
-    // -1..1, positive = steer right (D / right arrow must give +1). The
-    // vehicle frame is +Z forward / +Y up (right handed), whose geometric
-    // right side is -X, so "right" is a negative yaw — conversions live in
-    // Vehicle::Update, input backends only map keys to this semantic.
-    float steer = 0.f;
-    bool handbrake = false;
-    bool reverse = false;
-    bool drsToggle = false;
-    bool wingModeToggle = false;
-    bool overtake = false;
-    bool cameraCycle = false;
-    bool pause = false;
-    bool restart = false;
-    bool lookBack = false;
-
-    // Menu navigation (edge-triggered). Shared with W/S/A/D and arrows so the
-    // menu works without a mouse; only consumed in Menu/Settings phases.
-    bool menuUp = false;
-    bool menuDown = false;
-    bool menuLeft = false;
-    bool menuRight = false;
-    bool menuSelect = false;
-    bool menuBack = false;
-};
-
-class IInput {
-public:
-    virtual ~IInput() = default;
-    virtual InputState Poll() = 0;
-};
 
 
 
-
-// Headless renderer + scripted input. Implements the same unified interfaces
-// as RaylibBackend with no window, so the game logic (physics, race rules,
+// Headless renderer with no window, so the game logic (physics, race rules,
 // AI) can run in automated tests and on machines without a display. Doubles
-// as proof that the render/input layer is replaceable.
-class NullBackend final : public IRenderer, public IInput {
+// as proof that the render layer is replaceable. Input is separate — tests
+// drive it via NullInputSource + InputSystem (rush.engine.input).
+class NullBackend final : public IRenderer {
 public:
-    // Returned verbatim by Poll(); tests set this to drive the player car.
-    InputState scripted;
-
     // Fixed timestep reported by FrameTime(); physics runs deterministically.
     float frameDt = 1.f / 60.f;
 
-    // IRenderer -----------------------------------------------------------
     bool Init(int width, int height, const std::string& title) override;
     void Shutdown() override;
     bool ShouldClose() const override;
@@ -182,9 +143,6 @@ public:
     double TimeSeconds() const override;
     float FrameTime() const override;
     void CaptureScreenshot(const std::string& path) override;
-
-    // IInput --------------------------------------------------------------
-    InputState Poll() override;
 
     // Debug capture: record DrawMesh calls so the composed scene can be
     // exported (DumpObj) and inspected without a GPU/window.
@@ -211,13 +169,13 @@ private:
 
 
 
-// Raylib implementation of the unified render/input interfaces. All raylib
-// types stay inside this class so the game layer never sees them.
-class RaylibBackend final : public IRenderer, public IInput {
+// Raylib implementation of the render interface. All raylib types stay
+// inside this class so the game layer never sees them. Input is sampled by
+// RaylibInputSource (rush.engine.input), not here.
+class RaylibBackend final : public IRenderer {
 public:
     ~RaylibBackend() override;
 
-    // IRenderer
     bool Init(int width, int height, const std::string& title) override;
     void Shutdown() override;
     bool ShouldClose() const override;
@@ -244,9 +202,6 @@ public:
     double TimeSeconds() const override;
     float FrameTime() const override;
     void CaptureScreenshot(const std::string& path) override;
-
-    // IInput
-    InputState Poll() override;
 
 private:
     struct Impl;

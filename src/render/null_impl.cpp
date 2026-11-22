@@ -1,4 +1,4 @@
-﻿module;
+module;
 #include <cstdio>
 #include <string>
 #include <unordered_map>
@@ -63,8 +63,6 @@ Vec2f NullBackend::MeasureText2D(const std::string& text, int size) const {
 double NullBackend::TimeSeconds() const { return time_; }
 float NullBackend::FrameTime() const { return frameDt; }
 void NullBackend::CaptureScreenshot(const std::string&) {}
-
-InputState NullBackend::Poll() { return scripted; }
 
 void NullBackend::DumpObj(const std::string& path) const {
     std::FILE* f = std::fopen(path.c_str(), "w");

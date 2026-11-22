@@ -42,6 +42,7 @@ add_library(rush-engine STATIC
     src/core/map_csv.cpp
     src/core/paths_impl.cpp
     src/core/version.cpp
+    src/input/input_system.cpp
     src/job/job_impl.cpp
     src/physics/qu3e_impl.cpp
     src/physics/nudge_impl.cpp
@@ -56,6 +57,7 @@ target_sources(rush-engine PUBLIC
         modules/core.cppm
         modules/physics.cppm
         modules/render.cppm
+        modules/input.cppm
         modules/events.cppm
         modules/job.cppm
         modules/runtime.cppm
@@ -75,9 +77,10 @@ target_link_libraries(rush-engine
 )
 target_compile_features(rush-engine PUBLIC cxx_std_23)
 
-# raylib backend is optional: only compile when the host provides raylib.
+# raylib backend + input source are optional: only compile when the host
+# provides raylib (native/web interactive builds).
 if(RUSH_ENGINE_RAYLIB_TARGET)
-    target_sources(rush-engine PRIVATE src/render/raylib_impl.cpp)
+    target_sources(rush-engine PRIVATE src/render/raylib_impl.cpp src/input/raylib_source.cpp)
     target_link_libraries(rush-engine PRIVATE ${RUSH_ENGINE_RAYLIB_TARGET})
 endif()
 

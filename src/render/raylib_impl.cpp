@@ -1,4 +1,4 @@
-﻿module;
+module;
 #include <algorithm>
 #include <unordered_map>
 #include <string>
@@ -289,35 +289,6 @@ float RaylibBackend::FrameTime() const { return ::GetFrameTime(); }
 
 void RaylibBackend::CaptureScreenshot(const std::string& path) {
     ::TakeScreenshot(path.c_str());
-}
-
-InputState RaylibBackend::Poll() {
-    InputState state;
-
-    const bool forward = IsKeyDown(KEY_W) || IsKeyDown(KEY_UP);
-    const bool back = IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN);
-    const bool left = IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT);
-    const bool right = IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT);
-
-    state.throttle = forward ? 1.f : 0.f;
-    state.brake = back ? 1.f : 0.f;
-    state.steer = (right ? 1.f : 0.f) - (left ? 1.f : 0.f);
-    state.handbrake = IsKeyDown(KEY_SPACE);
-    state.reverse = IsKeyDown(KEY_R);
-    state.drsToggle = IsKeyPressed(KEY_F);
-    state.wingModeToggle = IsKeyPressed(KEY_V);
-    state.overtake = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
-    state.cameraCycle = IsKeyPressed(KEY_C);
-    state.pause = IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_P);
-    state.restart = IsKeyPressed(KEY_ENTER);
-    state.lookBack = IsKeyDown(KEY_B);
-    state.menuUp = IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_W);
-    state.menuDown = IsKeyPressed(KEY_DOWN) || IsKeyPressed(KEY_S);
-    state.menuLeft = IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_A);
-    state.menuRight = IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_D);
-    state.menuSelect = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE);
-    state.menuBack = IsKeyPressed(KEY_ESCAPE);
-    return state;
 }
 
 }  // namespace apex
