@@ -516,6 +516,34 @@ struct TransmissionParams {
     float brakeForceMax = 24000.f;    // N total
 };
 
+// Clutch-type LSD on the driven axle. The diff case is rigidly coupled to the
+// crank (omega_case = crank/ratio, average wheel speed locked); the only free
+// degree is the split delta = (wL - wR)/2. Bias torque T_b clamps to
+// +/- lockFactor*|T_axle|, so 1 = spool, 0 = open. Acceleration and decel
+// (engine braking) run separate parameter sets: F1 LSDs lock hard on power,
+// open up under braking so the tail does not step out.
+struct DifferentialParams {
+    float preloadAccel = 40.f;        // Nm base bias on power
+    float rampAccel = 120.f;          // Nm per rad/s of (wL - wR)
+    float lockFactorAccel = 0.65f;    // bias cap as fraction of |T_axle|
+    float preloadDecel = 8.f;         // Nm base bias under engine braking
+    float rampDecel = 30.f;           // Nm per rad/s
+    float lockFactorDecel = 0.35f;
+    float biasRateLimit = 4000.f;     // Nm/s slew limit on the bias torque
+    float deltaDamping = 20.f;        // 1/s — split-state damper. The tire
+                                      // force difference only restores the
+                                      // split in the unsaturated regime;
+                                      // under full spin-up (launch) both
+                                      // tires saturate and the bias would
+                                      // otherwise grow the split without
+                                      // bound. Models internal diff friction.
+    float deltaMax = 1.0f;            // rad/s — clutch slip limit of the LSD:
+                                      // the commanded per-wheel spin offset
+                                      // is clamped to +/- deltaMax, i.e. the
+                                      // split never outruns the case command
+                                      // (a locked case is delta == 0).
+};
+
 // Suspension: spring/damper per axle (front/rear independent), travel + camber.
 struct SuspensionParams {
     float springKf = 38000.f;         // front spring N/m
@@ -611,6 +639,7 @@ struct VehicleParams {
     // Components — replace / tune each independently (改车).
     EngineParams engine;
     TransmissionParams gearbox;
+    DifferentialParams differential;
     SuspensionParams suspension;
     AeroKitParams aero;
     DriverAssistanceParams assists;
@@ -761,20 +790,21 @@ private:
 };
 
 // --- Transmission ----------------------------------------------------------
-// Gear ratios / final drive / shift logic + drive & brake split.
+// Gear ratios / final drive / shift logic + axle-level drive, per-wheel brake.
 class Transmission {
 public:
     struct State { int gear = 1; float shiftTimer = 0.f; };  // gear 0 = reverse
     struct Output {
-        std::array<float, 4> drivePerWheel{};
+        float rearAxleDrive = 0.f;       // rear-axle total drive [N] (signed:
+                                         // negative in reverse / engine braking)
         std::array<float, 4> brakePerWheel{};
     };
 
     void Init(const TransmissionParams& p) { params_ = p; st_ = State{}; }
     // Shift logic + drive/brake split. `crankTorque` is the engine's net
     // driveline torque (throttle-inclusive, engine braking included, ERS
-    // already added at the crank); the caller slaves the driven wheels to
-    // the crank through the current ratio. rearBrakeScale comes from
+    // already added at the crank); the Differential component then splits the
+    // axle drive between the driven wheels. rearBrakeScale comes from
     // assistance (ESC tail-brake reserve).
     Output Compute(const CarInput& intent, float crankTorque, float rpm, float speed,
                    float forwardSpeed, float wheelRadius, float rearBrakeScale, float dt);
@@ -783,6 +813,40 @@ public:
 
 private:
     TransmissionParams params_;
+    State st_;
+};
+
+// --- Differential (clutch-type LSD on the driven axle) ----------------------
+// Case kinematics: (wL + wR)/2 = crank/ratio, enforced by the orchestrator
+// commanding each driven wheel at caseOmega +/- split (slaved). The split
+// state delta = (wL - wR)/2 feeds the bias law; its dynamics live in the
+// orchestrator, which owns the tire reaction forces:
+//   d(delta)/dt = (bias - (FxL - FxR)*r) / (2*Iw) - deltaDamping*delta
+// Splits the axle drive, never the brakes (ABS stays per-wheel).
+class Differential {
+public:
+    struct State {
+        float delta = 0.f;   // (wL - wR)/2 [rad/s], fed back into the bias law
+        float bias = 0.f;    // current bias torque [Nm] (HUD/debug readout)
+    };
+    struct Input {
+        float axleDrive = 0.f;  // rear-axle total drive [N] (signed)
+        float wheelRadius = 0.f;
+        float dt = 0.f;
+        float fxTorqueDiff = 0.f;  // (FxL - FxR) * r: tire reaction diff [Nm]
+        float wheelInertia = 0.f;  // per driven wheel [kg m^2]
+    };
+    struct Output { float driveL = 0.f, driveR = 0.f; };  // wheel-end drive [N]
+
+    void Init(const DifferentialParams& p) { params_ = p; st_ = State{}; }
+    // Bias law (clamp to +/- lockFactor*|T_axle|, slew-limited) -> split,
+    // then integrate the split state against tire reactions and damping.
+    Output Step(const Input& in);
+    const State& StateRef() const { return st_; }
+    void Reset() { st_ = State{}; }
+
+private:
+    DifferentialParams params_;
     State st_;
 };
 
@@ -947,6 +1011,7 @@ private:
     // Component assembly
     Engine engine_;
     Transmission gearbox_;
+    Differential diff_;
     Suspension susp_;
     AeroKit aero_;
     DriverAssistance assists_;
@@ -958,9 +1023,9 @@ private:
     // Mode latch (edge on wingToggle) — orchestrated in Update().
     bool wingTogglePrev_ = false;
 
-    // Per-wheel drive/brake split (N), filled by Transmission each substep.
-    std::array<float, 4> drivePerWheel_{};
+    // Per-wheel brake split (N) + rear-axle drive (N), filled each substep.
     std::array<float, 4> brakePerWheel_{};
+    float rearAxleDrive_ = 0.f;
 
     // Powertrain coupling state (engine <-> driveline).
     float drivelineLoad_ = 0.f;  // reflected load the engine stepped against

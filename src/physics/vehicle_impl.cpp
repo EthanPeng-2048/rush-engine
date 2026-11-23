@@ -305,15 +305,12 @@ Transmission::Output Transmission::Compute(const CarInput& intent, float crankTo
     float brakeForce = intent.brake * params_.brakeForceMax;
     if (intent.handbrake) brakeForce += params_.brakeForceMax * 0.65f;
 
-    // Split to wheels: drive/brake 50:50 per axle, brake biased 60:40 front.
-    const float drivePerRear = driveForce * 0.5f;
+    // Split to wheels: axle-level drive (the Differential splits it between
+    // the driven wheels), brake 60:40 front-biased per wheel.
     const float brakeFront = brakeForce * 0.6f * 0.5f;
     const float brakeRear = brakeForce * 0.4f * 0.5f * rearBrakeScale;
 
-    out.drivePerWheel[kFrontLeft] = 0.f;
-    out.drivePerWheel[kFrontRight] = 0.f;
-    out.drivePerWheel[kRearLeft] = drivePerRear;
-    out.drivePerWheel[kRearRight] = drivePerRear;
+    out.rearAxleDrive = driveForce;
     out.brakePerWheel[kFrontLeft] = brakeFront;
     out.brakePerWheel[kFrontRight] = brakeFront;
     out.brakePerWheel[kRearLeft] = brakeRear;
@@ -322,6 +319,48 @@ Transmission::Output Transmission::Compute(const CarInput& intent, float crankTo
 }
 
 void Transmission::Reset() { st_ = State{}; }
+
+// --- Differential -----------------------------------------------------------
+
+Differential::Output Differential::Step(const Input& in) {
+    Output out;
+    const float r = std::max(in.wheelRadius, 1e-3f);
+    const float T_axle = in.axleDrive * r;
+
+    // Power vs braking (engine braking included) parameter sets. Reverse
+    // drive is a signed negative force, same as engine braking.
+    const bool accel = T_axle > 0.f;
+    const float preload = accel ? params_.preloadAccel : params_.preloadDecel;
+    const float ramp = accel ? params_.rampAccel : params_.rampDecel;
+    const float lock = accel ? params_.lockFactorAccel : params_.lockFactorDecel;
+
+    // Bias law: preload + ramp on the split, capped at lockFactor * |T_axle|.
+    const float omegaDiff = 2.f * st_.delta;  // wL - wR
+    const float biasMax = lock * std::fabs(T_axle);
+    const float biasTarget = Clampf(preload + ramp * omegaDiff, -biasMax, biasMax);
+
+    // Slew limit: a preload step must not slam the bias torque in one
+    // substep (avoids oscillation at 240 Hz).
+    const float biasStep = params_.biasRateLimit * std::max(in.dt, 1e-5f);
+    st_.bias = Clampf(biasTarget, st_.bias - biasStep, st_.bias + biasStep);
+
+    // Split dynamics: the bias torque spins the faster wheel up, the tire
+    // reaction difference (in the unsaturated regime) restores it, and the
+    // damper bounds it under full spin-up where the reaction difference
+    // vanishes (both tires saturated). 2*Iw is the two-wheel inertia about
+    // the split degree of freedom. deltaMax is the clutch slip limit: the
+    // split cannot outrun the case command.
+    const float iw = std::max(in.wheelInertia, 1e-3f);
+    const float accelSplit =
+        (st_.bias - in.fxTorqueDiff) / (2.f * iw) - params_.deltaDamping * st_.delta;
+    st_.delta = Clampf(st_.delta + accelSplit * std::max(in.dt, 1e-5f), -params_.deltaMax,
+                       params_.deltaMax);
+
+    const float halfBias = st_.bias * 0.5f;
+    out.driveL = (T_axle * 0.5f + halfBias) / r;
+    out.driveR = (T_axle * 0.5f - halfBias) / r;
+    return out;
+}
 
 // --- Suspension ------------------------------------------------------------
 
@@ -713,6 +752,7 @@ void Vehicle::Spawn(IPhysicsWorld& world, const Transform& pose, const VehiclePa
     // Component assembly.
     engine_.Init(params.engine);
     gearbox_.Init(params.gearbox);
+    diff_.Init(params.differential);
     susp_.Init(params.suspension);
     aero_.Init(params.aero);
     assists_.Init(params.assists);
@@ -745,6 +785,7 @@ void Vehicle::Reset(const Transform& pose) {
     }
     engine_.Reset();
     gearbox_.Reset();
+    diff_.Reset();
     susp_.Reset();
     aero_.Reset();
     assists_.Reset();
@@ -851,7 +892,7 @@ void Vehicle::Update(const CarInput& input, float dt) {
     const float totalRatioNow = params_.gearbox.gearRatios[static_cast<size_t>(std::max(0, gearNow - 1))] *
                                 params_.gearbox.finalDrive;
 
-    drivePerWheel_ = gb.drivePerWheel;
+    rearAxleDrive_ = gb.rearAxleDrive;
     brakePerWheel_ = gb.brakePerWheel;
 
     // --- 5. Aero forces ----------------------------------------------------
@@ -870,8 +911,14 @@ void Vehicle::Update(const CarInput& input, float dt) {
     // --- 6. Wheels: copy suspension + apply tire forces ---------------------
     int grassWheels = 0, gravelWheels = 0;
     float rearFx = 0.f, rearBrake = 0.f;  // driveline load accumulation
+    float rearFxL = 0.f, rearFxR = 0.f;   // per-wheel Fx for the diff split dynamics
     const float crankOmega = engine_.StateRef().omega;
     const bool reverse = gearNow == 0;
+    // Differential case command: the rigid driveline locks the average rear-
+    // wheel speed to the crank; the split delta offsets each wheel around it
+    // (a spool is delta == 0). With the clutch open the wheels roll free.
+    const float caseOmega = (reverse ? -1.f : 1.f) * crankOmega / totalRatioNow;
+    const float deltaPrev = diff_.StateRef().delta;
     for (int i = 0; i < 4; ++i) {
         const Suspension::Corner& c = susp.corner[i];
         state_.wheels[i].grounded = c.grounded;
@@ -909,14 +956,17 @@ void Vehicle::Update(const CarInput& input, float dt) {
             ++gravelWheels;
         }
 
-        // Driven wheels are slaved to the crank while the clutch is engaged
-        // (rigid driveline); at standstill idle the clutch is open and they
-        // roll free like the front axle.
+        // Driven wheels are slaved to the differential case at their own
+        // commanded spin (case +/- split): the average stays locked to the
+        // crank while the LSD split offsets each wheel, so the bias shows up
+        // as real per-wheel slip. Drive force is delivered through the crank
+        // reaction (drivelineLoad_) exactly like the spool baseline; the
+        // Differential only reshapes the spin commands, never the brakes.
         const bool slaved = !IsFront(i) && !clutchOpen;
-        const float wheelOmega = (reverse ? -1.f : 1.f) * crankOmega / totalRatioNow;
+        const float wheelOmega = (i == kRearLeft) ? caseOmega + deltaPrev : caseOmega - deltaPrev;
         const TireModel::Output tire =
             tires_[i].Compute(c.load * surfaceGrip, c.contactVelocity, wheelForward, wheelRight,
-                              drivePerWheel_[i], brakeForce, dt, camber[i], slaved, wheelOmega);
+                              0.f, brakeForce, dt, camber[i], slaved, wheelOmega);
         (void)world_->ApplyForce(chassis_, tire.force, c.contactPoint);
         state_.wheels[i].force = tire.force;
         state_.wheels[i].slipRatio = tire.slipRatio;
@@ -929,7 +979,10 @@ void Vehicle::Update(const CarInput& input, float dt) {
         // driveline open (front braking outpacing the commanded wheel speed
         // would flip the rear to drive).
         if (!IsFront(i) && !clutchOpen) {
-            rearFx += Dot(tire.force, frame.forward);
+            const float fxAlong = Dot(tire.force, frame.forward);
+            rearFx += fxAlong;
+            if (i == kRearLeft) rearFxL = fxAlong;
+            else rearFxR = fxAlong;
             rearBrake += brakeForce;
         }
 
@@ -938,6 +991,20 @@ void Vehicle::Update(const CarInput& input, float dt) {
         state_.wheels[i].temperature += slipHeat * dt * 60.f;
         state_.wheels[i].temperature -= (state_.wheels[i].temperature - 65.f) * 0.35f * dt;
         state_.wheels[i].temperature = Clampf(state_.wheels[i].temperature, 40.f, 160.f);
+    }
+
+    // Differential split dynamics: bias vs tire-reaction difference, with the
+    // damper bounding the split under saturated spin-up. Steps AFTER the tire
+    // step so the reaction difference is the one just resolved; the updated
+    // delta feeds the next substep's commanded spins.
+    {
+        Differential::Input din;
+        din.axleDrive = rearAxleDrive_;
+        din.wheelRadius = params_.wheelRadius;
+        din.dt = dt;
+        din.fxTorqueDiff = (rearFxL - rearFxR) * params_.wheelRadius;
+        din.wheelInertia = params_.rearTire.wheelInertia;
+        (void)diff_.Step(din);
     }
 
     // Driveline load reflected to the crank for the next engine step.
