@@ -39,8 +39,8 @@ void rpcContactSolver::Initialize( rpcIsland *island )
 {
 	m_island = island;
 	m_contactCount = island->m_contactCount;
-	m_contacts = island->m_contactStates;
-	m_velocities = m_island->m_velocities;
+	m_contacts = island->m_contactStates.data( );
+	m_velocities = m_island->m_velocities.data( );
 	m_enableFriction = island->m_enableFriction;
 }
 

@@ -1,4 +1,4 @@
-﻿module;
+module;
 #include <algorithm>
 #include <cmath>
 #include <set>
@@ -306,6 +306,18 @@ rush::Result<Vec3> NudgeWorld::GetVelocityAtPoint(BodyHandle handle, const Vec3&
     const Vec3 w = FromNudge(body_get_angular_velocity(impl_->world, it->second.body));
     const Vec3 r = worldPoint - FromNudge(body_get_position(impl_->world, it->second.body));
     return v + Cross(w, r);
+}
+
+rush::Result<ChassisSnapshot> NudgeWorld::FetchChassis(BodyHandle handle) const {
+    ChassisSnapshot out;
+    const auto it = impl_->bodies.find(handle);
+    if (it != impl_->bodies.end()) {
+        out.transform.position = FromNudge(body_get_position(impl_->world, it->second.body));
+        out.transform.rotation = FromNudgeQuat(body_get_rotation(impl_->world, it->second.body));
+        out.linearVelocity = FromNudge(body_get_velocity(impl_->world, it->second.body));
+        out.angularVelocity = FromNudge(body_get_angular_velocity(impl_->world, it->second.body));
+    }
+    return out;
 }
 
 rush::Result<void> NudgeWorld::ApplyForce(BodyHandle handle, const Vec3& force, const Vec3& worldPoint) {

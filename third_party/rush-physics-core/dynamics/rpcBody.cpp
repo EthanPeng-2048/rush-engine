@@ -221,6 +221,14 @@ void rpcBody::ApplyLinearImpulseAtWorldPoint( const rpcVec3& impulse, const rpcV
 }
 
 //--------------------------------------------------------------------------------------------------
+void rpcBody::ApplyAngularImpulse( const rpcVec3& worldImpulse )
+{
+    m_angularVelocity += m_invInertiaWorld * worldImpulse;
+
+    SetToAwake( );
+}
+
+//--------------------------------------------------------------------------------------------------
 void rpcBody::ApplyTorque( const rpcVec3& torque )
 {
 	m_torque += torque;

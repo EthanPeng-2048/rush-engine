@@ -35,14 +35,33 @@
 //--------------------------------------------------------------------------------------------------
 // rpcIsland
 //--------------------------------------------------------------------------------------------------
+void rpcIsland::Reset( std::span<rpcBody*> bodies, std::span<rpcVelocityState> velocities,
+                       std::span<rpcContactConstraint*> contacts,
+                       std::span<rpcContactConstraintState> contactStates, r32 dt,
+                       const rpcVec3& gravity, i32 iterations, bool allowSleep,
+                       bool enableFriction )
+{
+	m_bodies = bodies;
+	m_velocities = velocities;
+	m_contacts = contacts;
+	m_contactStates = contactStates;
+	m_bodyCount = 0;
+	m_contactCount = 0;
+	m_dt = dt;
+	m_gravity = gravity;
+	m_iterations = iterations;
+	m_allowSleep = allowSleep;
+	m_enableFriction = enableFriction;
+}
+
 void rpcIsland::Solve( )
 {
 	// Apply gravity
 	// Integrate velocities and create state buffers, calculate world inertia
-	for ( i32 i = 0 ; i < m_bodyCount; ++i )
+	for ( i32 i = 0; i < m_bodyCount; ++i )
 	{
 		rpcBody *body = m_bodies[ i ];
-		rpcVelocityState *v = m_velocities + i;
+		rpcVelocityState *v = m_velocities.data( ) + i;
 
 		if ( body->m_flags & rpcBody::eDynamic )
 		{
@@ -86,10 +105,10 @@ void rpcIsland::Solve( )
 
 	// Copy back state buffers
 	// Integrate positions
-	for ( i32 i = 0 ; i < m_bodyCount; ++i )
+	for ( i32 i = 0; i < m_bodyCount; ++i )
 	{
 		rpcBody *body = m_bodies[ i ];
-		rpcVelocityState *v = m_velocities + i;
+		rpcVelocityState *v = m_velocities.data( ) + i;
 
 		if ( body->m_flags & rpcBody::eStatic )
 			continue;
@@ -148,18 +167,13 @@ void rpcIsland::Solve( )
 //--------------------------------------------------------------------------------------------------
 void rpcIsland::Add( rpcBody *body )
 {
-	assert( m_bodyCount < m_bodyCapacity );
-
 	body->m_islandIndex = m_bodyCount;
-
 	m_bodies[ m_bodyCount++ ] = body;
 }
 
 //--------------------------------------------------------------------------------------------------
 void rpcIsland::Add( rpcContactConstraint *contact )
 {
-	assert( m_contactCount < m_contactCapacity );
-
 	m_contacts[ m_contactCount++ ] = contact;
 }
 
@@ -170,7 +184,7 @@ void rpcIsland::Initialize( )
 	{
 		rpcContactConstraint *cc = m_contacts[ i ];
 
-		rpcContactConstraintState *c = m_contactStates + i;
+		rpcContactConstraintState *c = m_contactStates.data( ) + i;
 
 		c->centerA = cc->bodyA->m_worldCenter;
 		c->centerB = cc->bodyB->m_worldCenter;

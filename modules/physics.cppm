@@ -20,6 +20,15 @@ export namespace apex {
 using BodyHandle = uint32_t;
 constexpr BodyHandle kInvalidBody = 0;
 
+// One-shot chassis state fetch: the vehicle hot path reads transform +
+// velocities every substep — three separate getters would cost three handle
+// lookups per substep. Invalid handles yield a default snapshot (compat).
+struct ChassisSnapshot {
+    Transform transform;
+    Vec3 linearVelocity;
+    Vec3 angularVelocity;
+};
+
 // Convention for BodyDesc.userData on track surfaces: the pointer carries a
 // SurfaceType value cast through uintptr_t — never a real pointer. Ray hits
 // and contact events report it back so the vehicle can pick grip / damage
@@ -156,6 +165,10 @@ public:
     [[nodiscard]] virtual rush::Result<Vec3> GetVelocityAtPoint(BodyHandle body,
                                                                 const Vec3& worldPoint) const = 0;
 
+    // Batch fetch for the per-substep vehicle hot path (transform + linear +
+    // angular velocity in one backend round-trip instead of three lookups).
+    [[nodiscard]] virtual rush::Result<ChassisSnapshot> FetchChassis(BodyHandle body) const = 0;
+
     [[nodiscard]] virtual rush::Result<void> ApplyForce(BodyHandle body, const Vec3& force,
                                                         const Vec3& worldPoint) = 0;
     [[nodiscard]] virtual rush::Result<void> ApplyImpulse(BodyHandle body, const Vec3& impulse,
@@ -170,6 +183,11 @@ public:
 
     // Contacts from the most recent Step(). Used for damage part mapping.
     virtual std::vector<ContactEvent> DrainContacts() = 0;
+
+    // Optional parallel island solving (RPC backend). Bit-identical numerics
+    // to serial — only execution order changes. Default off: deterministic
+    // paths (drive-test) never enable it. Other backends ignore the call.
+    virtual void SetParallelIslands(bool enabled) { (void)enabled; }
 
     // --- Contact friction / extended raycast ------------------------------
     // RPC forwards these straight to rush-physics-core. Qu3e/Nudge forward
@@ -217,6 +235,7 @@ public:
     rush::Result<void> SetLinearVelocity(BodyHandle body, const Vec3& velocity) override;
     rush::Result<void> SetAngularVelocity(BodyHandle body, const Vec3& velocity) override;
     rush::Result<Vec3> GetVelocityAtPoint(BodyHandle body, const Vec3& worldPoint) const override;
+    rush::Result<ChassisSnapshot> FetchChassis(BodyHandle body) const override;
 
     rush::Result<void> ApplyForce(BodyHandle body, const Vec3& force,
                                   const Vec3& worldPoint) override;
@@ -267,6 +286,7 @@ public:
     rush::Result<void> SetLinearVelocity(BodyHandle body, const Vec3& velocity) override;
     rush::Result<void> SetAngularVelocity(BodyHandle body, const Vec3& velocity) override;
     rush::Result<Vec3> GetVelocityAtPoint(BodyHandle body, const Vec3& worldPoint) const override;
+    rush::Result<ChassisSnapshot> FetchChassis(BodyHandle body) const override;
 
     rush::Result<void> ApplyForce(BodyHandle body, const Vec3& force,
                                   const Vec3& worldPoint) override;
@@ -306,7 +326,6 @@ public:
     // game's physics rate ([physics] hz) so the setting is real.
     explicit RushPhysicsCore(float stepDt = 1.f / 240.f);
     ~RushPhysicsCore() override;
-
     void SetGravity(const Vec3& gravity) override;
     void Step(float dt) override;
 
@@ -321,12 +340,15 @@ public:
     rush::Result<void> SetLinearVelocity(BodyHandle body, const Vec3& velocity) override;
     rush::Result<void> SetAngularVelocity(BodyHandle body, const Vec3& velocity) override;
     rush::Result<Vec3> GetVelocityAtPoint(BodyHandle body, const Vec3& worldPoint) const override;
+    rush::Result<ChassisSnapshot> FetchChassis(BodyHandle body) const override;
 
     rush::Result<void> ApplyForce(BodyHandle body, const Vec3& force,
                                   const Vec3& worldPoint) override;
     rush::Result<void> ApplyImpulse(BodyHandle body, const Vec3& impulse,
                                     const Vec3& worldPoint) override;
     rush::Result<void> ApplyTorque(BodyHandle body, const Vec3& torque) override;
+
+    void SetParallelIslands(bool enabled) override;
 
     RayHit Raycast(const Vec3& origin, const Vec3& direction, float maxDistance,
                    BodyHandle ignore = kInvalidBody) const override;

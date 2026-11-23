@@ -10,6 +10,7 @@ add_library(rush-physics-core STATIC
     collision/rpcCollide.cpp
     common/rpcGeometry.cpp
     common/rpcMemory.cpp
+    common/rpcWorkerPool.cpp
     dynamics/rpcBody.cpp
     dynamics/rpcContact.cpp
     dynamics/rpcContactManager.cpp

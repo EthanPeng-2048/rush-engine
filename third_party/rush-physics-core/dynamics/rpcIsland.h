@@ -27,6 +27,8 @@
 #ifndef RPCISLAND_H
 #define RPCISLAND_H
 
+#include <span>
+
 #include "../math/rpcMath.h"
 #include "../common/rpcGeometry.h"
 #include "../common/rpcSettings.h"
@@ -45,6 +47,10 @@ struct rpcVelocityState
 	rpcVec3 v;
 };
 
+// One island = one connected constraint graph. The arrays are std::span
+// slices into the scene's contiguous pools (pre-sized to the scene caps), so
+// solving allocates nothing, keeps the whole batch cache-friendly, and owns
+// no raw memory.
 struct rpcIsland
 {
 	void Solve( );
@@ -52,15 +58,19 @@ struct rpcIsland
 	void Add( rpcContactConstraint *contact );
 	void Initialize( );
 
-	rpcBody **m_bodies;
-	rpcVelocityState *m_velocities;
-	i32 m_bodyCapacity;
-	i32 m_bodyCount;
+	// Attach this island to pool slices and re-arm counts for a fresh step.
+	void Reset( std::span<rpcBody*> bodies, std::span<rpcVelocityState> velocities,
+	            std::span<rpcContactConstraint*> contacts,
+	            std::span<rpcContactConstraintState> contactStates, r32 dt,
+	            const rpcVec3& gravity, i32 iterations, bool allowSleep,
+	            bool enableFriction );
 
-	rpcContactConstraint **m_contacts;
-	rpcContactConstraintState *m_contactStates;
+	std::span<rpcBody*> m_bodies;
+	std::span<rpcVelocityState> m_velocities;
+	std::span<rpcContactConstraint*> m_contacts;
+	std::span<rpcContactConstraintState> m_contactStates;
+	i32 m_bodyCount;
 	i32 m_contactCount;
-	i32 m_contactCapacity;
 
 	r32 m_dt;
 	rpcVec3 m_gravity;

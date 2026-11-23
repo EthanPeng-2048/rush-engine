@@ -71,6 +71,11 @@ public:
 	void ApplyForceAtWorldPoint( const rpcVec3& force, const rpcVec3& point );
 	void ApplyLinearImpulse( const rpcVec3& impulse );
 	void ApplyLinearImpulseAtWorldPoint( const rpcVec3& impulse, const rpcVec3& point );
+	// World-space angular impulse (matches the angular term of
+	// ApplyLinearImpulseAtWorldPoint) — lets a batch of point impulses be
+	// aggregated into one linear + one angular application.
+	void ApplyAngularImpulse( const rpcVec3& worldImpulse );
+	const rpcVec3& GetWorldCenter( ) const { return m_worldCenter; }
 	void ApplyTorque( const rpcVec3& torque );
 	void SetToAwake( );
 	void SetToSleep( );

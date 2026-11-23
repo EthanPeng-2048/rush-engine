@@ -598,7 +598,9 @@ DriverAssistance::Output DriverAssistance::Step(const CarInput& intent, const Ca
     // yaw damping + lateral damping (the big counter-steer is the controls').
     st_.escStrength = 0.f;
     if (params_.escLevel != AssistLevel::Off && !intent.handbrake && frame.speed > 5.f) {
-        const Vec3 geoRight = TransformDirection(frame.chassis, Vec3{-1.f, 0.f, 0.f});
+        // Geometric right is -X = -frame.right (the frame's +X is geometric
+        // left); reuse the already-rotated axis instead of another Rotate.
+        const Vec3 geoRight = -frame.right;
         const float beta = std::atan2(Dot(frame.velocity, geoRight),
                                       std::max(std::fabs(frame.forwardSpeed), 3.f));
         const float yawRate = Dot(frame.angularVelocity, frame.up);
@@ -652,7 +654,9 @@ DriverControls::Output DriverControls::Process(const CarInput& raw, const CarFra
     // on genuine oversteer (balanced cornering runs a small body slip angle).
     if (params_.steerLevel != AssistLevel::Off && frame.speed > params_.counterSteerMinSpeed &&
         !raw.handbrake) {
-        const Vec3 geoRight = TransformDirection(frame.chassis, Vec3{-1.f, 0.f, 0.f});
+        // Geometric right is -X = -frame.right (the frame's +X is geometric
+        // left); reuse the already-rotated axis instead of another Rotate.
+        const Vec3 geoRight = -frame.right;
         const float vRight = Dot(frame.velocity, geoRight);
         const float beta = std::atan2(vRight, std::max(std::fabs(frame.forwardSpeed), 3.f));
         const float yawRate = frame.angularVelocity.y;
@@ -881,14 +885,16 @@ void Vehicle::Update(const CarInput& input, float dt) {
     CarFrame frame;
     frame.world = world_;
     frame.dt = dt;
-    frame.chassis = world_->GetTransform(chassis_).value_or(Transform{});
-    frame.velocity = world_->GetLinearVelocity(chassis_).value_or(Vec3{});
+    // One batched backend round-trip instead of three handle lookups.
+    const ChassisSnapshot snap = world_->FetchChassis(chassis_).value_or(ChassisSnapshot{});
+    frame.chassis = snap.transform;
+    frame.velocity = snap.linearVelocity;
     frame.speed = Length(frame.velocity);
     frame.forward = TransformDirection(frame.chassis, Vec3{0.f, 0.f, 1.f});
     frame.forwardSpeed = Dot(frame.velocity, frame.forward);
     frame.right = TransformDirection(frame.chassis, Vec3{1.f, 0.f, 0.f});
     frame.up = TransformDirection(frame.chassis, Vec3{0.f, 1.f, 0.f});
-    frame.angularVelocity = world_->GetAngularVelocity(chassis_).value_or(Vec3{});
+    frame.angularVelocity = snap.angularVelocity;
 
     // --- 1. Driver controls: smoothing + counter-steer (input processing) --
     const DriverControls::Output ctrl = controls_.Process(input, frame, params_);

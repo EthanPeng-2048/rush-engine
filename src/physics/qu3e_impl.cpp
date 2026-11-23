@@ -298,6 +298,17 @@ rush::Result<Vec3> Qu3eWorld::GetVelocityAtPoint(BodyHandle handle, const Vec3& 
     return it == impl_->bodies.end() ? Vec3{} : FromQ3(it->second->GetVelocityAtWorldPoint(ToQ3(worldPoint)));
 }
 
+rush::Result<ChassisSnapshot> Qu3eWorld::FetchChassis(BodyHandle handle) const {
+    ChassisSnapshot out;
+    const auto it = impl_->bodies.find(handle);
+    if (it != impl_->bodies.end()) {
+        out.transform = FromQ3Transform(it->second->GetTransform(), it->second->GetQuaternion());
+        out.linearVelocity = FromQ3(it->second->GetLinearVelocity());
+        out.angularVelocity = FromQ3(it->second->GetAngularVelocity());
+    }
+    return out;
+}
+
 rush::Result<void> Qu3eWorld::ApplyForce(BodyHandle handle, const Vec3& force, const Vec3& worldPoint) {
     // Buffer and convert to an impulse in Step(): qu3e's ApplyForceAtWorldPoint
     // treats its argument as a mass-scaled acceleration (m_force += force *

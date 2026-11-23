@@ -25,6 +25,7 @@
 //--------------------------------------------------------------------------------------------------
 
 #include <stdlib.h>
+#include <stdio.h>
 
 #include "rpcScene.h"
 #include "../dynamics/rpcBody.h"
@@ -32,6 +33,7 @@
 #include "../dynamics/rpcContact.h"
 #include "../dynamics/rpcContactSolver.h"
 #include "../collision/rpcBox.h"
+#include "../common/rpcWorkerPool.h"
 
 //--------------------------------------------------------------------------------------------------
 // rpcScene
@@ -40,6 +42,8 @@ rpcScene::rpcScene( r32 dt, const rpcVec3& gravity, i32 iterations )
 	: m_contactManager( &m_stack )
 	, m_boxAllocator( sizeof( rpcBox ), 256 )
 	, m_bodyCount( 0 )
+	, m_dynamicCount( 0 )
+	, m_contactPeak( 0 )
 	, m_bodyList( NULL )
 	, m_gravity( gravity )
 	, m_dt( dt )
@@ -47,6 +51,8 @@ rpcScene::rpcScene( r32 dt, const rpcVec3& gravity, i32 iterations )
 	, m_newBox( false )
 	, m_allowSleep( true )
 	, m_enableFriction( true )
+	, m_parallelIslands( false )
+	, m_workers( NULL )
 {
 }
 
@@ -54,6 +60,8 @@ rpcScene::rpcScene( r32 dt, const rpcVec3& gravity, i32 iterations )
 rpcScene::~rpcScene( )
 {
 	Shutdown( );
+	// m_workers is the process-wide shared singleton (rpcWorkerPool::Shared)
+	// — it outlives every scene and must never be deleted here.
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -74,37 +82,59 @@ void rpcScene::Step( )
 //--------------------------------------------------------------------------------------------------
 void rpcScene::SolveIslands( )
 {
+	// Batch path: build every island up front, then solve (serial or across
+	// the worker pool — bit-identical numerics, islands share no writable
+	// state). Static track bodies never size the pools, so steady-state
+	// solving allocates and clears nothing.
+	SolveIslandsBatched( );
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcScene::SolveIslandsBatched( )
+{
+	// Dynamic bodies only: static eIsland flags are reset right after each
+	// island build (shared statics must re-join later islands), so they
+	// never leak across steps — clearing them here would walk 6000+ track
+	// bodies per step for nothing.
 	for ( rpcBody* body = m_bodyList; body; body = body->m_next )
-		body->m_flags &= ~rpcBody::eIsland;
+	{
+		if ( !( body->m_flags & rpcBody::eStatic ) )
+			body->m_flags &= ~rpcBody::eIsland;
+	}
 
-	// Size the stack island, pick worst case size: every body and every
-	// contact could land in a single island, so reserve for the full scene.
-	m_stack.Reserve(
-		sizeof( rpcBody* ) * m_bodyCount
-		+ sizeof( rpcVelocityState ) * m_bodyCount
-		+ sizeof( rpcContactConstraint* ) * m_contactManager.m_contactCount
-		+ sizeof( rpcContactConstraintState ) * m_contactManager.m_contactCount
-		+ sizeof( rpcBody* ) * m_bodyCount
-	);
+	// Worst case: every DYNAMIC body seeds its own island — the static
+	// track bodies (thousands) must never size the batch pools, or the pools
+	// balloon into hundreds of megabytes and TLB-trash every step. Pools
+	// grow ×2 and never shrink; each island spans a contiguous slice written
+	// through span views, so steady-state solving allocates and clears
+	// nothing.
+	const size_t maxIslands = (size_t)rpcMax( 1, m_dynamicCount );
+	// Island body capacity: an island can hold every dynamic body plus the
+	// static bodies it touches (a static body appears in many islands), so
+	// cap at the full scene size — still cheap once maxIslands is small.
+	const size_t islandCap = (size_t)m_bodyCount;
+	// Contact pools size against the monotone contact peak, never the raw
+	// per-step count: the count jitters (240/334/274...) and a pool that
+	// reallocates on every step burns tens of microseconds of copies.
+	m_contactPeak = rpcMax( m_contactPeak, m_contactManager.m_contactCount );
+	const size_t contactCap = (size_t)rpcMax( 1, m_contactPeak );
+	const auto growPool = []( auto& pool, size_t need ) {
+		if ( pool.capacity( ) < need )
+			pool.reserve( need * 2 );
+	};
+	growPool( m_poolBodies, maxIslands * islandCap );
+	growPool( m_poolVelocities, maxIslands * islandCap );
+	growPool( m_poolContacts, maxIslands * contactCap );
+	growPool( m_poolContactStates, maxIslands * contactCap );
+	if ( m_dfsStack.size( ) < islandCap )
+		m_dfsStack.resize( islandCap );
+	if ( m_islands.size( ) < maxIslands )
+		m_islands.resize( maxIslands );
 
-	rpcIsland island;
-	island.m_bodyCapacity = m_bodyCount;
-	island.m_contactCapacity = m_contactManager.m_contactCount;
-	island.m_bodies = (rpcBody**)m_stack.Allocate( sizeof( rpcBody* ) * m_bodyCount );
-	island.m_velocities = (rpcVelocityState *)m_stack.Allocate( sizeof( rpcVelocityState ) * m_bodyCount );
-	island.m_contacts = (rpcContactConstraint **)m_stack.Allocate( sizeof( rpcContactConstraint* ) * island.m_contactCapacity );
-	island.m_contactStates = (rpcContactConstraintState *)m_stack.Allocate( sizeof( rpcContactConstraintState ) * island.m_contactCapacity );
-	island.m_allowSleep = m_allowSleep;
-	island.m_enableFriction = m_enableFriction;
-	island.m_bodyCount = 0;
-	island.m_contactCount = 0;
-	island.m_dt = m_dt;
-	island.m_gravity = m_gravity;
-	island.m_iterations = m_iterations;
-
-	// Build each active island and then solve each built island
-	i32 stackSize = m_bodyCount;
-	rpcBody** stack = (rpcBody**)m_stack.Allocate( sizeof( rpcBody* ) * stackSize );
+	// Build every island and Initialize() right away: Initialize snapshots
+	// body->m_islandIndex, which a shared static body would overwrite if the
+	// islands were built first and initialized later.
+	i32 islandCount = 0;
 	for ( rpcBody* seed = m_bodyList; seed; seed = seed->m_next )
 	{
 		// Seed cannot be apart of an island already
@@ -120,29 +150,62 @@ void rpcScene::SolveIslands( )
 		if ( seed->m_flags & rpcBody::eStatic )
 			continue;
 
-		BuildIsland( seed, island, stack, stackSize );
+		const size_t slot = (size_t)islandCount;
+		rpcIsland& island = m_islands[ slot ];
+		island.Reset(
+			std::span<rpcBody*>( m_poolBodies.data( ) + slot * islandCap, islandCap ),
+			std::span<rpcVelocityState>( m_poolVelocities.data( ) + slot * islandCap, islandCap ),
+			std::span<rpcContactConstraint*>( m_poolContacts.data( ) + slot * contactCap, contactCap ),
+			std::span<rpcContactConstraintState>( m_poolContactStates.data( ) + slot * contactCap, contactCap ),
+			m_dt, m_gravity, m_iterations, m_allowSleep, m_enableFriction );
 
-		assert( island.m_bodyCount != 0 );
+		BuildIsland( seed, island, m_dfsStack.data( ), (i32)m_dfsStack.size( ) );
 
-		island.Initialize( );
-		island.Solve( );
-
-		// Reset all static island flags
-		// This allows static bodies to participate in other island formations
-		for ( i32 i = 0; i < island.m_bodyCount; i++ )
+		// Clear the static-body island flags right away: a shared static body
+		// (ground, walls) must be re-joinable by later islands, otherwise its
+		// m_islandIndex stays stale and Solve() indexes out of bounds. Keep
+		// Initialize() before the next island overwrites those indices.
+		for ( i32 i = 0; i < island.m_bodyCount; ++i )
 		{
 			rpcBody *body = island.m_bodies[ i ];
-
 			if ( body->m_flags & rpcBody::eStatic )
 				body->m_flags &= ~rpcBody::eIsland;
 		}
+		island.Initialize( );
+
+		++islandCount;
 	}
 
-	m_stack.Free( stack );
-	m_stack.Free( island.m_contactStates );
-	m_stack.Free( island.m_contacts );
-	m_stack.Free( island.m_velocities );
-	m_stack.Free( island.m_bodies );
+	// Solve all islands. Parallel and serial execution are bit-identical:
+	// islands share no writable state (static bodies are only read in
+	// rpcIsland::Solve). Gate on workload: tiny batches lose more to
+	// synchronization than they gain (16-car grids stay serial). The pool is
+	// the process-wide singleton — never created on this hot path.
+	if ( !m_parallelIslands || !m_workers )
+	{
+		for ( i32 i = 0; i < islandCount; ++i )
+			m_islands[ (size_t)i ].Solve( );
+		return;
+	}
+	const i32 workers = (i32)m_workers->WorkerCount( ) + 1;
+	if ( islandCount < 4 * workers )
+	{
+		for ( i32 i = 0; i < islandCount; ++i )
+			m_islands[ (size_t)i ].Solve( );
+		return;
+	}
+	m_workers->Run( rpcSolveIslandTask, this, islandCount );
+}
+
+//--------------------------------------------------------------------------------------------------
+// Island-solve worker task (D9): one island per task. Islands are disjoint
+// body sets; static bodies appear in several islands but rpcIsland::Solve
+// only reads them. Bit-identical to serial solving.
+void rpcSolveIslandTask( i32 index, void* arg )
+{
+	rpcScene* scene = (rpcScene*)arg;
+	rpcIsland& island = scene->m_islands[ (size_t)index ];
+	island.Solve( );
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -150,8 +213,6 @@ void rpcScene::BuildIsland( rpcBody* seed, rpcIsland& island, rpcBody** stack, i
 {
 	i32 stackCount = 0;
 	stack[ stackCount++ ] = seed;
-	island.m_bodyCount = 0;
-	island.m_contactCount = 0;
 
 	// Mark seed as apart of island
 	seed->m_flags |= rpcBody::eIsland;
@@ -224,9 +285,13 @@ void rpcScene::SyncAndFind( )
 	// Look for new contacts
 	m_contactManager.FindNewContacts( );
 
-	// Clear all forces
+	// Clear all forces — dynamic bodies only: static bodies never receive
+	// forces (L2 applies forces to vehicles), so skipping them removes a
+	// 6000+ body walk from every step.
 	for ( rpcBody* body = m_bodyList; body; body = body->m_next )
 	{
+		if ( body->m_flags & rpcBody::eStatic )
+			continue;
 		rpcIdentity( body->m_force );
 		rpcIdentity( body->m_torque );
 	}
@@ -247,6 +312,8 @@ rpcBody* rpcScene::CreateBody( const rpcBodyDef& def )
 
 	m_bodyList = body;
 	++m_bodyCount;
+	if ( !( body->m_flags & rpcBody::eStatic ) )
+		++m_dynamicCount;
 
 	return body;
 }
@@ -271,6 +338,8 @@ void rpcScene::RemoveBody( rpcBody* body )
 		m_bodyList = body->m_next;
 
 	--m_bodyCount;
+	if ( !( body->m_flags & rpcBody::eStatic ) )
+		--m_dynamicCount;
 
 	m_heap.Free( body );
 }
@@ -316,6 +385,17 @@ void rpcScene::SetIterations( i32 iterations )
 void rpcScene::SetEnableFriction( bool enabled )
 {
 	m_enableFriction = enabled;
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcScene::SetParallelIslands( bool enabled )
+{
+	if ( m_parallelIslands == enabled )
+		return;
+	m_parallelIslands = enabled;
+	// The pool is the process-wide shared singleton (created at startup,
+	// never resized/torn down); the flag just switches its use on/off.
+	m_workers = enabled ? &rpcWorkerPool::Shared( ) : NULL;
 }
 
 //--------------------------------------------------------------------------------------------------

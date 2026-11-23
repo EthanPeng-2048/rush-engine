@@ -10,6 +10,7 @@ module;
 #include <exstl/error_macros.hpp>
 #include "rpc.h"
 #include "dynamics/rpcContact.h"
+#include "common/rpcWorkerPool.h"
 
 module rush.engine.physics;
 import rush.engine.core;
@@ -40,12 +41,41 @@ Transform FromRpcTransform(const rpcTransform& t, const rpcQuaternion& q) {
 }
 
 // Real error channel for the RPC adapter (unlike qu3e/nudge compat layers).
-rush::Result<rpcBody*> FindBody(const std::unordered_map<BodyHandle, rpcBody*>& bodies, BodyHandle handle) {
-    const auto it = bodies.find(handle);
-    if (it == bodies.end() || !it->second) {
+// The handle table is a dense vector indexed by BodyHandle (handles are
+// allocated strictly increasing and never recycled), so the hot-path lookup
+// is one array read instead of a hash probe.
+struct BodyTable {
+    std::vector<rpcBody*> bodies;   // index = handle, null = freed slot
+    BodyHandle next = 1;
+
+    rpcBody* Get(BodyHandle handle) const {
+        return handle < bodies.size() ? bodies[handle] : nullptr;
+    }
+    void Set(BodyHandle handle, rpcBody* body) {
+        if (handle >= bodies.size()) bodies.resize(handle + 1, nullptr);
+        bodies[handle] = body;
+    }
+    void Erase(BodyHandle handle) {
+        if (handle < bodies.size()) bodies[handle] = nullptr;
+    }
+};
+
+// Hot-path lookup: the vehicle calls these per substep with handles it owns
+// for the whole race, so Release skips the Result wrapping entirely (a bad
+// handle is a programming error caught by the Debug assert). The checked
+// EX_FAIL channel stays on the cold paths (CreateBody/DestroyBody/Friction).
+static rpcBody* FindBodyFast(const BodyTable& table, BodyHandle handle) {
+    rpcBody* body = table.Get(handle);
+    assert(body);
+    return body;
+}
+
+rush::Result<rpcBody*> FindBody(const BodyTable& table, BodyHandle handle) {
+    rpcBody* body = table.Get(handle);
+    if (!body) {
         EX_FAIL("rpc: invalid body handle " + std::to_string(handle));
     }
-    return it->second;
+    return body;
 }
 
 rush::Result<rpcBox*> FindBox(const std::unordered_map<BodyHandle, rpcBox*>& boxes, BodyHandle handle) {
@@ -81,7 +111,7 @@ rush::Result<void> ValidateBodyDesc(const BodyDesc& desc) {
 struct RushPhysicsCore::Impl final : public rpcContactListener {
 public:
     struct PendingForce {
-        BodyHandle body = kInvalidBody;
+        rpcBody* body = nullptr;  // resolved at ApplyForce; no second lookup
         Vec3 force;
         Vec3 point;
     };
@@ -89,10 +119,15 @@ public:
     explicit Impl(float stepDt)
         // rpcScene advances by the fixed dt given here on every Step(). The
         // game calls Step() once per physics substep, so use the same rate.
-        : scene(stepDt, rpcVec3{0.f, -9.81f, 0.f}, 12) {}
+        : scene(stepDt, rpcVec3{0.f, -9.81f, 0.f}, 12) {
+        // Pre-warm the process-wide worker pool at world creation (race
+        // load), so enabling island parallelism later never pays thread
+        // creation on the physics hot path.
+        (void)rpcWorkerPool::Shared();
+    }
 
     rpcScene scene;
-    std::unordered_map<BodyHandle, rpcBody*> bodies;
+    BodyTable bodies;   // dense handle->body table (index = handle)
     std::unordered_map<BodyHandle, rpcBox*> bodyBoxes;
     BodyHandle nextHandle = 1;
     std::vector<ContactEvent> contacts;
@@ -194,11 +229,38 @@ RushPhysicsCore::~RushPhysicsCore() = default;
 void RushPhysicsCore::SetGravity(const Vec3& gravity) { impl_->scene.SetGravity(ToRpc(gravity)); }
 
 void RushPhysicsCore::Step(float dt) {
+    // Aggregate the buffered forces into one impulse application per body:
+    // linear impulses sum directly, world angular impulses sum as well
+    // (r x J), so each body pays one inertia application instead of ~11.
+    // Mathematically identical; only the float summation order differs.
+    struct AggImpulse {
+        rpcBody* body;
+        Vec3 linear;
+        Vec3 angular;
+    };
+    std::vector<AggImpulse> agg;
+    // Pre-size so push_back never reallocates while slots are referenced.
+    agg.reserve(impl_->pendingForces.size());
     for (const Impl::PendingForce& pf : impl_->pendingForces) {
-        // Handles were validated in ApplyForce; drop if destroyed mid-frame.
-        const auto it = impl_->bodies.find(pf.body);
-        if (it == impl_->bodies.end() || !it->second) continue;
-        it->second->ApplyLinearImpulseAtWorldPoint(ToRpc(pf.force * dt), ToRpc(pf.point));
+        // Handle was validated in ApplyForce; drop if destroyed mid-frame.
+        if (!pf.body) continue;
+        size_t idx = agg.size();
+        for (size_t i = 0; i < agg.size(); ++i) {
+            if (agg[i].body == pf.body) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx == agg.size()) agg.push_back({pf.body, Vec3{}, Vec3{}});
+        AggImpulse& slot = agg[idx];  // valid: capacity pre-sized above
+        const Vec3 j = pf.force * dt;
+        const Vec3 r = pf.point - FromRpc(pf.body->GetWorldCenter());
+        slot.linear += j;
+        slot.angular += Cross(r, j);
+    }
+    for (const AggImpulse& a : agg) {
+        a.body->ApplyLinearImpulse(ToRpc(a.linear));
+        a.body->ApplyAngularImpulse(ToRpc(a.angular));
     }
     impl_->pendingForces.clear();
     (void)dt;  // rpcScene advances by the dt fixed at construction (1/240).
@@ -277,7 +339,7 @@ rush::Result<BodyHandle> RushPhysicsCore::CreateBody(const BodyDesc& desc) {
         impl_->boxToBody[box] = impl_->nextHandle;
         firstBox = const_cast<rpcBox*>(box);
     }
-    impl_->bodies[impl_->nextHandle] = body;
+    impl_->bodies.Set(impl_->nextHandle, body);
     impl_->bodyBoxes[impl_->nextHandle] = firstBox;
     return impl_->nextHandle++;
 }
@@ -289,8 +351,14 @@ rush::Result<void> RushPhysicsCore::DestroyBody(BodyHandle handle) {
         boxIt != impl_->bodyBoxes.end() && boxIt->second) {
         impl_->boxToBody.erase(boxIt->second);
     }
+    // Pending forces hold pre-resolved body pointers; purge this body's
+    // entries so Step() can never touch a destroyed body.
+    for (auto it = impl_->pendingForces.begin(); it != impl_->pendingForces.end();) {
+        if (it->body == *body) it = impl_->pendingForces.erase(it);
+        else ++it;
+    }
     impl_->scene.RemoveBody(*body);
-    impl_->bodies.erase(handle);
+    impl_->bodies.Erase(handle);
     impl_->bodyBoxes.erase(handle);
     return {};
 }
@@ -337,8 +405,19 @@ rush::Result<void> RushPhysicsCore::SetAngularVelocity(BodyHandle handle, const 
 }
 
 rush::Result<Vec3> RushPhysicsCore::GetVelocityAtPoint(BodyHandle handle, const Vec3& worldPoint) const {
-    EX_TRY(body, FindBody(impl_->bodies, handle));
-    return FromRpc((*body)->GetVelocityAtWorldPoint(ToRpc(worldPoint)));
+    // Hot path (suspension, 4x per substep): unchecked fast lookup.
+    rpcBody* body = FindBodyFast(impl_->bodies, handle);
+    return FromRpc(body->GetVelocityAtWorldPoint(ToRpc(worldPoint)));
+}
+
+rush::Result<ChassisSnapshot> RushPhysicsCore::FetchChassis(BodyHandle handle) const {
+    // Hot path (once per substep per vehicle): unchecked fast lookup.
+    rpcBody* body = FindBodyFast(impl_->bodies, handle);
+    ChassisSnapshot out;
+    out.transform = FromRpcTransform(body->GetTransform(), body->GetQuaternion());
+    out.linearVelocity = FromRpc(body->GetLinearVelocity());
+    out.angularVelocity = FromRpc(body->GetAngularVelocity());
+    return out;
 }
 
 rush::Result<void> RushPhysicsCore::ApplyForce(BodyHandle handle, const Vec3& force, const Vec3& worldPoint) {
@@ -346,10 +425,9 @@ rush::Result<void> RushPhysicsCore::ApplyForce(BodyHandle handle, const Vec3& fo
     // treats its argument as a mass-scaled acceleration (m_force += force *
     // mass) while leaving the torque term unscaled, so passing Newtons makes
     // linear response mass-independent and explodes. Impulses have clean
-    // semantics on both axes. Validate the handle now so bad forces fail loud.
-    EX_TRY(body, FindBody(impl_->bodies, handle));
-    (void)body;
-    impl_->pendingForces.push_back({handle, force, worldPoint});
+    // semantics on both axes. Hot path (~11x per substep): unchecked fast
+    // lookup; Step() applies the pre-resolved pointer without a second one.
+    impl_->pendingForces.push_back({FindBodyFast(impl_->bodies, handle), force, worldPoint});
     return {};
 }
 
@@ -360,8 +438,9 @@ rush::Result<void> RushPhysicsCore::ApplyImpulse(BodyHandle handle, const Vec3& 
 }
 
 rush::Result<void> RushPhysicsCore::ApplyTorque(BodyHandle handle, const Vec3& torque) {
-    EX_TRY(body, FindBody(impl_->bodies, handle));
-    (*body)->ApplyTorque(ToRpc(torque));
+    // Hot path (aero/ESC, once or twice per substep): unchecked fast lookup.
+    rpcBody* body = FindBodyFast(impl_->bodies, handle);
+    body->ApplyTorque(ToRpc(torque));
     return {};
 }
 
@@ -385,6 +464,10 @@ std::vector<ContactEvent> RushPhysicsCore::DrainContacts() {
     std::vector<ContactEvent> out;
     CollisionBus().Drain(out);
     return out;
+}
+
+void RushPhysicsCore::SetParallelIslands(bool enabled) {
+    impl_->scene.SetParallelIslands(enabled);
 }
 
 // --- Contact friction / raycast: straight native forward into rpc* --------

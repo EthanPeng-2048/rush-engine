@@ -28,6 +28,7 @@
 #define RPCSCENE_H
 
 #include <stdio.h>
+#include <vector>
 
 #include "../common/rpcSettings.h"
 #include "../common/rpcMemory.h"
@@ -39,8 +40,15 @@
 class rpcBody;
 struct rpcBodyDef;
 struct rpcContactConstraint;
+struct rpcContactConstraintState;
+struct rpcVelocityState;
 class rpcRender;
 struct rpcIsland;
+class rpcWorkerPool;
+// Island-solve worker task (D9): Initialize/Solve one prebuilt island. The
+// islands share no writable state, so parallel execution is bit-identical
+// to serial — only the order changes.
+void rpcSolveIslandTask( i32 index, void* arg );
 
 // This listener is used to gather information about two shapes colliding. This
 // can be used for game logic and sounds. Physics objects created in these
@@ -108,6 +116,14 @@ public:
 	// another. The friction force resists this sliding motion.
 	void SetEnableFriction( bool enabled );
 
+	// Parallel island solving (D9): solves every island's velocity/position
+	// constraints across a worker pool. Islands share no writable state, so
+	// results are bit-identical to serial solving; only the execution order
+	// changes. Default OFF — enable only outside deterministic paths
+	// (drive-test stays serial).
+	void SetParallelIslands( bool enabled );
+	bool ParallelIslands( ) const { return m_parallelIslands; }
+
 	// Render the scene with an interpolated time between the last frame and
 	// the current simulation step.
 	void Render( rpcRender* render ) const;
@@ -151,6 +167,7 @@ public:
 private:
 	// Step pipeline stages (rpc-refactor.md D6): one concern per method.
 	void SolveIslands( );	// seed loop: BuildIsland per seed, then Initialize/Solve
+	void SolveIslandsBatched( );	// build-all islands, then solve (serial or pooled)
 	void SyncAndFind( );	// SynchronizeProxies + FindNewContacts + clear forces
 
 	// DFS the constraint graph from seed into the working island. Stack must
@@ -162,6 +179,8 @@ private:
 
 	i32 m_bodyCount;
 	rpcBody* m_bodyList;
+	i32 m_dynamicCount;   // cached (CreateBody/RemoveBody maintain it)
+	i32 m_contactPeak;    // pool sizing upper bound (monotone, never shrinks)
 
 	rpcStack m_stack;
 	rpcHeap m_heap;
@@ -174,7 +193,25 @@ private:
 	bool m_allowSleep;
 	bool m_enableFriction;
 
+	// Parallel island solving (D9): lazily-built worker pool; the pool is
+	// only touched when parallel solving is enabled (never in deterministic
+	// paths).
+	bool m_parallelIslands;
+	rpcWorkerPool* m_workers;
+
+	// Island batch pools (contiguous, pre-sized to the scene caps): each
+	// island's spans slice into these, so solving allocates nothing, stays
+	// cache-friendly and owns no raw memory. Worst case = every dynamic body
+	// seeds its own island.
+	std::vector<rpcBody*> m_poolBodies;
+	std::vector<rpcVelocityState> m_poolVelocities;
+	std::vector<rpcContactConstraint*> m_poolContacts;
+	std::vector<rpcContactConstraintState> m_poolContactStates;
+	std::vector<rpcIsland> m_islands;   // island slots (indexed by seed)
+	std::vector<rpcBody*> m_dfsStack;   // island-build DFS stack (reused)
+
 	friend class rpcBody;
+	friend void rpcSolveIslandTask( i32 index, void* arg );
 };
 
 #endif // RPCSCENE_H
