@@ -431,9 +431,14 @@ void InputSystem::Consume(InputState& out) {
         const std::string_view name = InputNameOf(ev.nameId);
         // Accept "foo", "foo.click", "foo.down", "foo.dblclick" or
         // "foo.longpress" as the press edge for the same action base.
+        // Must verify the FULL base prefix: menu.up / menu.down / menu.back
+        // share the "menu." head, so a suffix-only check wrongly matched
+        // "menu.back.click" against "menu.down" (index 10 == '.').
         auto match = [&](std::string_view base) {
-            if (name == base) return true;
-            if (name.size() < base.size() + 1 || name[base.size()] != '.') return false;
+            if (name.size() < base.size()) return false;
+            if (name.substr(0, base.size()) != base) return false;
+            if (name.size() == base.size()) return true;
+            if (name[base.size()] != '.') return false;
             const std::string_view suffix = name.substr(base.size() + 1);
             return suffix == "click" || suffix == "down" || suffix == "dblclick" ||
                    suffix == "longpress";
