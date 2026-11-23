@@ -586,6 +586,8 @@ struct SuspensionParams {
 
 // Aero kit: front wing / rear wing / sidepods / floor. Owns part health and
 // the damage→area / DRS / X-Z / pitch rules (was game-layer WriteVehicleAero).
+// Also the directional-stability derivatives: body slip beta feeds an aero
+// side force and yaw moment (the >80 km/h stability source in real F1).
 struct AeroKitParams {
     float airDensity = 1.225f;
     float dragArea = 1.02f;           // Cd*A
@@ -593,6 +595,20 @@ struct AeroKitParams {
     float frontDownforceShare = 0.44f;
     float centerOfPressureOffset = 0.1f;  // +Z moves aero balance rearward
     float aeroPitchBalance = 0.35f;   // front-share shift per rad of nose-up pitch
+
+    // Directional stability: side force = -q*sideArea*ClBeta*beta along the
+    // body right axis (geometric left), yaw moment = -q*sideArea*Lref*
+    // (CnBeta*beta + CnR*yawRate) about body up. q = 0.5*rho*v^2.
+    float sideArea = 1.15f;           // m^2 lateral reference area
+    float aeroClBeta = 2.6f;          // /rad side-force derivative
+    float aeroCnBeta = 0.9f;          // /rad yaw-moment derivative
+    float aeroCnR = 0.10f;            // 1/(rad/s) yaw damping derivative
+    float aeroRefLength = 3.6f;       // m moment reference length (= wheelbase)
+
+    // COP height above CG: the aero resultant acts at this height, so the
+    // side force produces roll moment (balanced by the suspension roll
+    // stiffness) and drag/downforce keep their pitch moments.
+    float copHeight = 0.22f;          // m
 };
 
 // Driver assistance (TCS/ESC/ABS): modulates actuator requests, NOT input.
@@ -920,8 +936,11 @@ public:
         std::array<float, 4> partHealth{1.f, 1.f, 1.f, 1.f};  // CarPart indexed
     };
     struct Output {
-        Vec3 cop;                      // drag application point (chassis space)
+        Vec3 cop;                      // aero resultant application point
+                                       // (chassis space, raised by copHeight)
         float frontDF = 0.f, rearDF = 0.f, drag = 0.f;
+        Vec3 sideForce;                // directional-stability side force (world)
+        Vec3 yawMoment;                // directional-stability yaw moment (world)
     };
 
     void Init(const AeroKitParams& p) { params_ = p; st_ = State{}; }

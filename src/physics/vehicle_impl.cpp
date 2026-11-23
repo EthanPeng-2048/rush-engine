@@ -521,11 +521,25 @@ AeroKit::Output AeroKit::Compute(const CarFrame& frame, WingMode wingMode, bool 
     st_.rearDownforce = dyn * rearDfArea;
     st_.dragForce = dyn * dragArea;
 
+    // Directional stability: body slip beta (along +X = geometric left) and
+    // yaw rate feed the aero side force / yaw moment derivatives. The terms
+    // scale with q ~ v^2, so they vanish at standstill — no extra gate.
+    const float vLat = Dot(frame.velocity, frame.right);
+    const float beta = std::atan2(vLat, std::max(std::fabs(frame.forwardSpeed), 3.f));
+    const float yawRate = Dot(frame.angularVelocity, frame.up);
+    const float qSide = dyn * params_.sideArea;
+    const Vec3 sideForce = frame.right * (-qSide * params_.aeroClBeta * beta);
+    const float yawMag = -qSide * params_.aeroRefLength *
+                         (params_.aeroCnBeta * beta + params_.aeroCnR * yawRate);
+
     Output out;
     out.frontDF = st_.frontDownforce;
     out.rearDF = st_.rearDownforce;
     out.drag = st_.dragForce;
-    out.cop = frame.chassis.position + frame.forward * params_.centerOfPressureOffset;
+    out.cop = frame.chassis.position + frame.forward * params_.centerOfPressureOffset +
+              frame.up * params_.copHeight;
+    out.sideForce = sideForce;
+    out.yawMoment = frame.up * yawMag;
     return out;
 }
 
@@ -924,15 +938,25 @@ void Vehicle::Update(const CarInput& input, float dt) {
 
     // --- 5. Aero forces ----------------------------------------------------
     const AeroKit::Output aero = aero_.Compute(frame, state_.wingMode, state_.drsActive);
-    const Vec3 worldUp{0.f, 1.f, 0.f};
     if (aero.frontDF + aero.rearDF > 1.f) {
-        const Vec3 frontPoint = frame.chassis.position + frame.forward * (params_.wheelbase * 0.5f);
-        const Vec3 rearPoint = frame.chassis.position - frame.forward * (params_.wheelbase * 0.5f);
-        (void)world_->ApplyForce(chassis_, -worldUp * aero.frontDF, frontPoint);
-        (void)world_->ApplyForce(chassis_, -worldUp * aero.rearDF, rearPoint);
+        // Downforce along the BODY up axis (not world up): on a banked or
+        // pitched surface the load presses the car onto the road correctly.
+        // The application points sit at the aero centre height, so drag and
+        // downforce keep their pitch moments through the COP offset.
+        const Vec3 frontPoint = frame.chassis.position + frame.forward * (params_.wheelbase * 0.5f) +
+                                frame.up * params_.aero.copHeight;
+        const Vec3 rearPoint = frame.chassis.position - frame.forward * (params_.wheelbase * 0.5f) +
+                               frame.up * params_.aero.copHeight;
+        (void)world_->ApplyForce(chassis_, -frame.up * aero.frontDF, frontPoint);
+        (void)world_->ApplyForce(chassis_, -frame.up * aero.rearDF, rearPoint);
     }
     if (frame.speed > 0.2f) {
         (void)world_->ApplyForce(chassis_, Normalize(frame.velocity) * -aero.drag, aero.cop);
+        // Directional stability: the side force acts at the COP (raised by
+        // copHeight -> roll moment balanced by the suspension), the yaw
+        // moment directly about the body up axis.
+        (void)world_->ApplyForce(chassis_, aero.sideForce, aero.cop);
+        (void)world_->ApplyTorque(chassis_, aero.yawMoment);
     }
 
     // --- 6. Wheels: copy suspension + apply tire forces ---------------------
