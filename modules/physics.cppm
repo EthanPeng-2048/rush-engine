@@ -405,6 +405,9 @@ public:
         float slipAngleDeg = 0.f;
         float slipMagnitude = 0.f;
         float wearDelta = 0.f;
+        float alignMoment = 0.f; // self-aligning yaw moment (body-up axis):
+                                 // -fyLat * casterTrail, positive restores a
+                                 // right-hand turn (negative yaw) to center.
     };
 
     // Separate default ctor: clang rejects `= {}` as a default argument here
@@ -421,10 +424,12 @@ public:
     // slaved: wheel spin is externally commanded (driven axle slaved to the
     // crank through the gear); the tire then only resolves the slip force —
     // no free spin integration, drive/brake torque no longer spins the wheel.
+    // casterTrail: suspension caster trail [m]; the lateral force then emits
+    // a self-aligning yaw moment (0 = no align moment, e.g. rear wheels).
     Output Compute(float verticalLoad, const Vec3& contactVelocity, const Vec3& forward,
                    const Vec3& right, float driveForce, float brakeForce, float dt,
                    float camberLean = 0.f, bool slaved = false,
-                   float omegaCommanded = 0.f);
+                   float omegaCommanded = 0.f, float casterTrail = 0.f);
 
     float Wear() const { return wear_; }
     void SetWear(float wear) { wear_ = Clampf(wear, 0.f, 1.f); }
@@ -544,7 +549,9 @@ struct DifferentialParams {
                                       // (a locked case is delta == 0).
 };
 
-// Suspension: spring/damper per axle (front/rear independent), travel + camber.
+// Suspension: spring/damper per axle (front/rear independent), travel, camber,
+// anti-roll bars and the equivalent geometry parameters (caster trail for
+// self-aligning torque, static toe, per-axle camber, roll steer).
 struct SuspensionParams {
     float springKf = 38000.f;         // front spring N/m
     float damperCf = 2100.f;          // front damper Ns/m
@@ -552,8 +559,29 @@ struct SuspensionParams {
     float damperCr = 2100.f;          // rear damper Ns/m
     float suspensionRestLength = 0.16f;
     float suspensionMaxTravel = 0.22f;
-    float camberStatic = 0.035f;      // ~2 deg static negative camber
-    float camberGain = 0.65f;         // how much body roll the camber claws back
+
+    // Anti-roll bars: equal-and-opposite load correction from the axle's
+    // compression difference (0 = no bar). Front/rear ratio tunes the roll
+    // stiffness split = cornering balance.
+    float kArbF = 9000.f;             // N/m equivalent
+    float kArbR = 12000.f;
+
+    // Caster trail: front self-aligning torque = Fy * trail, applied as yaw
+    // moment about the body up axis (rear wheels run trail = 0).
+    float casterTrailF = 0.035f;      // m
+
+    // Static toe (rad): front on top of steer, rear direct.
+    float toeF = 0.0015f;             // ~0.09 deg toe-in
+    float toeR = -0.0005f;
+
+    // Camber per axle (static negative) and roll claw-back ratio.
+    float camberStaticF = 0.030f;
+    float camberStaticR = 0.040f;
+    float camberGainF = 0.60f;
+    float camberGainR = 0.70f;
+
+    // Roll steer (rad/rad): steer += rollSteerF * frontRoll (default off).
+    float rollSteerF = 0.f;
 };
 
 // Aero kit: front wing / rear wing / sidepods / floor. Owns part health and
@@ -851,8 +879,9 @@ private:
 };
 
 // --- Suspension (front/rear) -----------------------------------------------
-// 4 raycast springs/dampers → per-corner load + contact. Front/rear params
-// independent. Also emits the simplified camber for the tire model.
+// 4 raycast springs/dampers → per-corner load + contact, anti-roll bars, and
+// the equivalent geometry (toe, per-axle camber, roll steer). Front/rear
+// params independent. Emits the simplified camber for the tire model.
 class Suspension {
 public:
     struct Corner {
@@ -860,14 +889,18 @@ public:
         float compression = 0.f, load = 0.f, suspensionLength = 0.f;
         SurfaceType surface = SurfaceType::None;
         Vec3 contactPoint, contactNormal, contactVelocity;
+        // Wheel frame axes in world (toe applied, steer NOT — the orchestrator
+        // adds the ESC-corrected steer + roll steer on top).
+        Vec3 wheelForward, wheelRight;
     };
     struct State { std::array<Corner, 4> corner; };
 
     void Init(const SuspensionParams& p) { params_ = p; st_ = State{}; }
-    // Per-wheel raycast. hardpoints are chassis-local attach points; steerAngle
-    // [rad] rotates the front wheels. Fills camber[4] (rad) for the tire model.
+    // Per-wheel raycast. hardpoints are chassis-local attach points; front
+    // wheels get static toe (steer is applied by the orchestrator with the
+    // assistance trim). Fills camber[4] (rad) for the tire model.
     void Step(const CarFrame& frame, BodyHandle chassis, float wheelRadius,
-              float trackWidth, float steerAngle, const std::array<Vec3, 4>& hardpoints,
+              float trackWidth, const std::array<Vec3, 4>& hardpoints,
               float camber[4], float dt);
     const State& StateRef() const { return st_; }
     void Reset();

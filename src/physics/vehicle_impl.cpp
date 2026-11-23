@@ -42,7 +42,7 @@ void TireModel::Reset() {
 TireModel::Output TireModel::Compute(float verticalLoad, const Vec3& contactVelocity,
                                      const Vec3& forward, const Vec3& right, float driveForce,
                                      float brakeForce, float dt, float camberLean, bool slaved,
-                                     float omegaCommanded) {
+                                     float omegaCommanded, float casterTrail) {
     Output out;
     const float r = params_.wheelRadius;
     const float Iw = params_.wheelInertia;
@@ -126,6 +126,12 @@ TireModel::Output TireModel::Compute(float verticalLoad, const Vec3& contactVelo
     fyLat = Clampf(fyLat, -1.15f * peak, 1.15f * peak);
 
     out.force = forward * fx + right * fyLat;
+
+    // Self-aligning yaw moment: lateral force times caster trail. fyLat runs
+    // along `right` (+X = geometric left), so a right-hand turn (fyLat < 0)
+    // emits a positive (restoring) up-yaw moment — sign convention: right
+    // turn is negative yaw, alignment adds positive yaw.
+    out.alignMoment = -fyLat * casterTrail;
 
     // Wear accrues from sliding dissipation.
     const float sliding = std::fabs(vLong * kappa) + std::fabs(vLat * tanA);
@@ -365,18 +371,21 @@ Differential::Output Differential::Step(const Input& in) {
 // --- Suspension ------------------------------------------------------------
 
 void Suspension::Step(const CarFrame& frame, BodyHandle chassis, float wheelRadius,
-                      float trackWidth, float steerAngle,
-                      const std::array<Vec3, 4>& hardpoints, float camber[4], float dt) {
+                      float trackWidth, const std::array<Vec3, 4>& hardpoints, float camber[4],
+                      float dt) {
     const Vec3 up = frame.up;
     for (int i = 0; i < 4; ++i) {
         const Vec3 hardpoint = TransformPoint(frame.chassis, hardpoints[i]);
-        // Steering: front wheels yaw around the hardpoint.
+        // Static toe (front toeF, rear toeR) rotates the wheel frame around
+        // the body up axis. Steer itself is applied by the orchestrator so
+        // the ESC-corrected angle reaches the tire model.
+        const float toe = IsFront(i) ? params_.toeF : params_.toeR;
         Vec3 wheelForward = frame.forward;
         Vec3 wheelRight = frame.right;
-        if (IsFront(i)) {
-            const Quat steerQ = Quat::FromAxisAngle(up, steerAngle);
-            wheelForward = Rotate(steerQ, frame.forward);
-            wheelRight = Rotate(steerQ, frame.right);
+        if (toe != 0.f) {
+            const Quat toeQ = Quat::FromAxisAngle(up, toe);
+            wheelForward = Rotate(toeQ, frame.forward);
+            wheelRight = Rotate(toeQ, frame.right);
         }
 
         const float maxLen = params_.suspensionRestLength + params_.suspensionMaxTravel;
@@ -411,6 +420,8 @@ void Suspension::Step(const CarFrame& frame, BodyHandle chassis, float wheelRadi
             corner.load = normalForce;
             corner.surface = SurfaceFromTag(hit.userData);
             corner.contactVelocity = frame.world->GetVelocityAtPoint(chassis, hit.point).value_or(Vec3{});
+            corner.wheelForward = wheelForward;
+            corner.wheelRight = wheelRight;
 
             // Suspension force along the strut (chassis up).
             (void)frame.world->ApplyForce(chassis, up * normalForce, hit.point);
@@ -422,20 +433,37 @@ void Suspension::Step(const CarFrame& frame, BodyHandle chassis, float wheelRadi
             corner.contactNormal = Vec3{};
             corner.contactVelocity = Vec3{};
             corner.surface = SurfaceType::None;
+            corner.wheelForward = wheelForward;
+            corner.wheelRight = wheelRight;
         }
     }
 
-    // Simplified camber: static negative camber plus body roll claw-back.
+    // Anti-roll bars: equal-and-opposite load correction from the axle's
+    // compression difference. Total axle load and net force are unchanged;
+    // the correction becomes roll moment through the wheel contact offsets,
+    // and front/rear bar ratio tunes the roll stiffness split = balance.
+    const float arbF = params_.kArbF *
+                       (st_.corner[kFrontLeft].compression - st_.corner[kFrontRight].compression);
+    st_.corner[kFrontLeft].load -= arbF;
+    st_.corner[kFrontRight].load += arbF;
+    const float arbR = params_.kArbR *
+                       (st_.corner[kRearLeft].compression - st_.corner[kRearRight].compression);
+    st_.corner[kRearLeft].load -= arbR;
+    st_.corner[kRearRight].load += arbR;
+    for (int i = 0; i < 4; ++i) st_.corner[i].load = std::max(0.f, st_.corner[i].load);
+
+    // Simplified camber: static negative camber plus body roll claw-back,
+    // per axle.
     const float rollF =
         (st_.corner[kFrontLeft].compression - st_.corner[kFrontRight].compression) / trackWidth;
     const float rollR =
         (st_.corner[kRearLeft].compression - st_.corner[kRearRight].compression) / trackWidth;
-    const float camberShiftF = (params_.camberGain - 1.f) * rollF;
-    const float camberShiftR = (params_.camberGain - 1.f) * rollR;
-    camber[0] = params_.camberStatic + camberShiftF;
-    camber[1] = -params_.camberStatic + camberShiftF;
-    camber[2] = params_.camberStatic + camberShiftR;
-    camber[3] = -params_.camberStatic + camberShiftR;
+    const float camberShiftF = (params_.camberGainF - 1.f) * rollF;
+    const float camberShiftR = (params_.camberGainR - 1.f) * rollR;
+    camber[0] = params_.camberStaticF + camberShiftF;
+    camber[1] = -params_.camberStaticF + camberShiftF;
+    camber[2] = params_.camberStaticR + camberShiftR;
+    camber[3] = -params_.camberStaticR + camberShiftR;
 }
 
 void Suspension::Reset() { st_ = State{}; }
@@ -827,8 +855,7 @@ void Vehicle::Update(const CarInput& input, float dt) {
 
     // --- 2. Suspension: per-corner loads + contacts -------------------------
     float camber[4];
-    susp_.Step(frame, chassis_, params_.wheelRadius, params_.trackWidth, ctrl.steer,
-               hardpoints_, camber, dt);
+    susp_.Step(frame, chassis_, params_.wheelRadius, params_.trackWidth, hardpoints_, camber, dt);
     const Suspension::State& susp = susp_.StateRef();
     const float rearLoad = susp.corner[kRearLeft].load + susp.corner[kRearRight].load;
 
@@ -912,6 +939,7 @@ void Vehicle::Update(const CarInput& input, float dt) {
     int grassWheels = 0, gravelWheels = 0;
     float rearFx = 0.f, rearBrake = 0.f;  // driveline load accumulation
     float rearFxL = 0.f, rearFxR = 0.f;   // per-wheel Fx for the diff split dynamics
+    float alignMoment = 0.f;              // caster-trail self-aligning yaw
     const float crankOmega = engine_.StateRef().omega;
     const bool reverse = gearNow == 0;
     // Differential case command: the rigid driveline locks the average rear-
@@ -934,12 +962,19 @@ void Vehicle::Update(const CarInput& input, float dt) {
             continue;
         }
 
-        Vec3 wheelForward = frame.forward;
-        Vec3 wheelRight = frame.right;
+        // Wheel frame from the suspension (static toe applied); front wheels
+        // add the assistance-corrected steer plus roll steer (front-axle
+        // roll → toe change) around the body up axis.
+        Vec3 wheelForward = c.wheelForward;
+        Vec3 wheelRight = c.wheelRight;
         if (IsFront(i)) {
-            const Quat steerQ = Quat::FromAxisAngle(frame.up, aid.steer);
-            wheelForward = Rotate(steerQ, frame.forward);
-            wheelRight = Rotate(steerQ, frame.right);
+            const float frontRoll =
+                (susp.corner[kFrontLeft].compression - susp.corner[kFrontRight].compression) /
+                params_.trackWidth;
+            const Quat steerQ =
+                Quat::FromAxisAngle(frame.up, aid.steer + params_.suspension.rollSteerF * frontRoll);
+            wheelForward = Rotate(steerQ, wheelForward);
+            wheelRight = Rotate(steerQ, wheelRight);
         }
 
         float brakeForce = brakePerWheel_[i];
@@ -964,14 +999,16 @@ void Vehicle::Update(const CarInput& input, float dt) {
         // Differential only reshapes the spin commands, never the brakes.
         const bool slaved = !IsFront(i) && !clutchOpen;
         const float wheelOmega = (i == kRearLeft) ? caseOmega + deltaPrev : caseOmega - deltaPrev;
+        const float trail = IsFront(i) ? params_.suspension.casterTrailF : 0.f;
         const TireModel::Output tire =
             tires_[i].Compute(c.load * surfaceGrip, c.contactVelocity, wheelForward, wheelRight,
-                              0.f, brakeForce, dt, camber[i], slaved, wheelOmega);
+                              0.f, brakeForce, dt, camber[i], slaved, wheelOmega, trail);
         (void)world_->ApplyForce(chassis_, tire.force, c.contactPoint);
         state_.wheels[i].force = tire.force;
         state_.wheels[i].slipRatio = tire.slipRatio;
         state_.wheels[i].slipAngleDeg = tire.slipAngleDeg;
         state_.wheels[i].wear = tires_[i].Wear();
+        alignMoment += tire.alignMoment;
 
         // Driveline load: the rear axle's measured reaction — tire force plus
         // applied brake torque. This is the coupling torque the crank must
@@ -991,6 +1028,11 @@ void Vehicle::Update(const CarInput& input, float dt) {
         state_.wheels[i].temperature += slipHeat * dt * 60.f;
         state_.wheels[i].temperature -= (state_.wheels[i].temperature - 65.f) * 0.35f * dt;
         state_.wheels[i].temperature = Clampf(state_.wheels[i].temperature, 40.f, 160.f);
+    }
+
+    // Self-aligning yaw moment from caster trail (front axle only).
+    if (alignMoment != 0.f) {
+        (void)world_->ApplyTorque(chassis_, frame.up * alignMoment);
     }
 
     // Differential split dynamics: bias vs tire-reaction difference, with the
