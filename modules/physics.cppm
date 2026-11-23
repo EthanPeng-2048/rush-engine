@@ -418,9 +418,13 @@ public:
     // i.e. the geometric LEFT side — see Vehicle.cpp frame notes).
     // driveForce/brakeForce: contact-plane forces [N] for this wheel.
     // camberLean: wheel-top lean toward the geometric right [rad].
+    // slaved: wheel spin is externally commanded (driven axle slaved to the
+    // crank through the gear); the tire then only resolves the slip force —
+    // no free spin integration, drive/brake torque no longer spins the wheel.
     Output Compute(float verticalLoad, const Vec3& contactVelocity, const Vec3& forward,
                    const Vec3& right, float driveForce, float brakeForce, float dt,
-                   float camberLean = 0.f);
+                   float camberLean = 0.f, bool slaved = false,
+                   float omegaCommanded = 0.f);
 
     float Wear() const { return wear_; }
     void SetWear(float wear) { wear_ = Clampf(wear, 0.f, 1.f); }
@@ -461,6 +465,133 @@ enum class AssistLevel : int {
     Full = 2,
 };
 
+// ============================================================================
+// Component parameter sets. Each car component owns its tuning knobs so the
+// game can swap parts (改车) or replace whole systems (engine/gearbox) without
+// touching the others.
+
+// Engine: torque curve, crankshaft dynamics (I_c * dw = T_gas - T_fric -
+// T_load), simplified combustion (firing pulses / rev limiter / misfire) and
+// the 2026 hybrid ERS store. rpm is a force-balance result, not a table.
+struct EngineParams {
+    float maxTorque = 420.f;          // Nm at the crank (gas torque, WOT, peak)
+    float idleRpm = 3800.f;
+    float peakRpm = 10500.f;
+    float redlineRpm = 12500.f;
+
+    // Crankshaft dynamics
+    float crankInertia = 0.45f;       // kg m^2
+    int cylinders = 6;                // firing rate = rpm/60 * cylinders/2
+    float intakeLag = 0.025f;         // s — throttle -> airflow (first order)
+    float torquePulse = 0.05f;        // per-firing torque ripple (frac of maxTorque)
+    float misfireRate = 0.02f;        // per firing event
+    uint32_t misfireSeed = 0x5EED2026u;  // fixed seed: replay-safe randomness
+
+    // Rev limiter (hysteretic fuel cut)
+    float fuelCutRpm = 12500.f;
+    float fuelCutResumeRpm = 12150.f;
+
+    // Engine braking = crank friction + throttle pumping (replaces the old
+    // wheel-side engineBrakeTorque).
+    float frictionC0 = 12.f;          // Nm base
+    float frictionC1 = 0.004f;        // Nm per rad/s
+    float pumpingTorque = 25.f;       // Nm at fully closed throttle
+    float idleHoldTorque = 320.f;     // idle governor cap [Nm]
+
+    // ERS / overtake (2026 hybrid store)
+    float ersCapacity = 4.0e6f;       // J
+    float ersDeployPower = 350000.f;  // W
+    float ersRegenPower = 250000.f;   // W under braking
+    float ersBaseCharge = 0.55f;
+    float overtakeMultiplier = 1.28f;
+};
+
+// Transmission: gear ratios / final drive / shift logic + drive & brake split.
+struct TransmissionParams {
+    float finalDrive = 3.0f;
+    std::array<float, 8> gearRatios = {3.5f, 2.95f, 2.55f, 2.25f, 2.0f, 1.8f, 1.62f, 1.48f};
+    float shiftUpRpm = 11800.f;
+    float shiftDownRpm = 7200.f;
+    float shiftTime = 0.06f;
+    float brakeForceMax = 24000.f;    // N total
+};
+
+// Suspension: spring/damper per axle (front/rear independent), travel + camber.
+struct SuspensionParams {
+    float springKf = 38000.f;         // front spring N/m
+    float damperCf = 2100.f;          // front damper Ns/m
+    float springKr = 38000.f;         // rear spring N/m
+    float damperCr = 2100.f;          // rear damper Ns/m
+    float suspensionRestLength = 0.16f;
+    float suspensionMaxTravel = 0.22f;
+    float camberStatic = 0.035f;      // ~2 deg static negative camber
+    float camberGain = 0.65f;         // how much body roll the camber claws back
+};
+
+// Aero kit: front wing / rear wing / sidepods / floor. Owns part health and
+// the damage→area / DRS / X-Z / pitch rules (was game-layer WriteVehicleAero).
+struct AeroKitParams {
+    float airDensity = 1.225f;
+    float dragArea = 1.02f;           // Cd*A
+    float downforceArea = 5.7f;       // Cl*A ≈ 2.3x car weight at 250 km/h
+    float frontDownforceShare = 0.44f;
+    float centerOfPressureOffset = 0.1f;  // +Z moves aero balance rearward
+    float aeroPitchBalance = 0.35f;   // front-share shift per rad of nose-up pitch
+};
+
+// Driver assistance (TCS/ESC/ABS): modulates actuator requests, NOT input.
+struct DriverAssistanceParams {
+    AssistLevel absLevel = AssistLevel::Sport;
+    AssistLevel tcLevel = AssistLevel::Sport;
+    AssistLevel escLevel = AssistLevel::Sport;
+
+    // TCS
+    float tcThreshFull = 0.115f;
+    float tcThreshSport = 0.20f;
+    float tcCutGain = 6.1f;
+    float tcBudgetReserveFull = 0.94f;   // traction budget for the driven axle
+    float tcBudgetReserveSport = 1.10f;
+
+    // ABS
+    float absThreshFull = 0.115f;
+    float absThreshSport = 0.18f;
+    float absReleaseGain = 6.f;
+    float absMaxRelease = 0.91f;
+
+    // ESC
+    float escStrengthFull = 1.f;
+    float escStrengthSport = 0.58f;
+    float escYawFull = 6.6f;
+    float escYawSport = 4.3f;
+    float escLateral = 1.9f;
+    float escRearBrakeReserve = 0.39f;
+    float escRearBrakeGain = 5.7f;
+    float escOversteerYaw = 0.25f;
+    float escOversteerBeta = 0.06f;
+    float escBetaDeepFull = 0.14f;
+    float escBetaDeepSport = 0.18f;
+};
+
+// Driver controls: keyboard smoothing + counter-steer/anti-spin. This is
+// input processing — explicitly NOT part of the assistance component.
+struct DriverControlsParams {
+    float steerTauUnwind = 0.11f;          // faster release easing
+    float steerTauWindBase = 0.10f;
+    float steerTauWindPerSpeed = 0.0032f;  // wind-up slows with speed
+    float steerTauWindMax = 0.34f;
+    float throttleRate = 10.f;             // /s easing toward full
+    float brakeRate = 14.f;
+    float counterSteerMaxFull = 0.85f;     // of steer range
+    float counterSteerMaxSport = 0.45f;
+    float counterSteerBetaNorm = 0.15f;
+    float counterSteerExcessNorm = 0.6f;
+    float oversteerYaw = 0.2f;
+    float oversteerBeta = 0.06f;
+    float oversteerBetaDeep = 0.18f;
+    float counterSteerMinSpeed = 6.f;
+    AssistLevel steerLevel = AssistLevel::Full;
+};
+
 // Complete parameter set for one car. Defaults approximate a 2026-spec F1
 // car at simcade level (Real Racing 3 / Monoposto feel).
 struct VehicleParams {
@@ -473,64 +604,27 @@ struct VehicleParams {
     float trackWidth = 1.58f;
     float wheelRadius = 0.33f;
 
-    // Suspension (per corner)
-    float springK = 38000.f;          // N/m
-    float damperC = 2100.f;           // Ns/m
-    float suspensionRestLength = 0.16f;
-    float suspensionMaxTravel = 0.22f;
-
     // Tires (front = steering tire, rear = drive tire; see Params::Front/Rear)
     TireModel::Params frontTire = TireModel::Params::Front();
     TireModel::Params rearTire = TireModel::Params::Rear();
 
-    // Powertrain (rear-wheel drive)
-    float maxTorque = 420.f;          // Nm at the crank
-    float idleRpm = 3800.f;
-    float peakRpm = 10500.f;
-    float redlineRpm = 12500.f;
-    float finalDrive = 3.0f;
-    std::array<float, 8> gearRatios = {3.5f, 2.95f, 2.55f, 2.25f, 2.0f, 1.8f, 1.62f, 1.48f};
-    float shiftUpRpm = 11800.f;
-    float shiftDownRpm = 7200.f;
-    float shiftTime = 0.06f;
-    float engineBrakeTorque = 90.f;
-    float brakeForceMax = 24000.f;    // N total
-
-    // Aero  (force = 0.5 * rho * coeff * v^2)
-    float airDensity = 1.225f;
-    float dragArea = 1.02f;           // Cd*A
-    float downforceArea = 5.7f;       // Cl*A ≈ 2.3x car weight at 250 km/h
-    float frontDownforceShare = 0.44f;
-    float centerOfPressureOffset = 0.1f;  // +Z moves aero balance rearward
-    float aeroPitchBalance = 0.35f;   // front-share shift per rad of nose-up pitch
-
-    // Assists (graded: Off / Sport / Full). Defaults match the playability
-    // target: steering aid fully on, the rest at Sport.
-    AssistLevel absLevel = AssistLevel::Sport;
-    AssistLevel tcLevel = AssistLevel::Sport;
-    AssistLevel escLevel = AssistLevel::Sport;
-    AssistLevel steerLevel = AssistLevel::Full;
+    // Components — replace / tune each independently (改车).
+    EngineParams engine;
+    TransmissionParams gearbox;
+    SuspensionParams suspension;
+    AeroKitParams aero;
+    DriverAssistanceParams assists;
+    DriverControlsParams controls;
 
     // No-damage mode: collisions still bounce, but parts never lose health.
     bool damageEnabled = true;
 
     // Season rules ([season] in config): classic (DRS) and 2026 (active
-    // aero + override) never mix. Game sets these from the season preset /
-    // per-feature toggles at spawn; the vehicle gates activation itself so
-    // a stale input can't leak a disabled system. Aero *effects* of DRS /
-    // wing mode are game-computed (VehicleInput aero areas), not engine
-    // formulas — only activation flags live here.
+    // aero + override) never mix. Game sets these at spawn; the vehicle
+    // gates activation itself so a stale input can't leak a disabled system.
     bool drsEnabled = true;          // classic: DRS on straights
     bool activeAeroEnabled = false;  // 2026: X/Z wing modes (V)
     bool overtakeEnabled = false;    // 2026: manual override deploy (SHIFT)
-
-    // ERS / overtake
-    float ersCapacity = 4.0e6f;       // J
-    float ersDeployPower = 350000.f;  // W
-    float ersRegenPower = 250000.f;   // W under braking
-    float ersBaseCharge = 0.55f;
-
-    float overtakeMultiplier = 1.28f;
 };
 
 // Live state of one wheel.
@@ -563,7 +657,6 @@ struct VehicleState {
     float brake = 0.f;
     float steerAngleDeg = 0.f;
     std::array<WheelState, 4> wheels;
-    std::array<float, 4> partHealth;  // CarPart indexed, 1 = intact
     float ersCharge = 0.f;            // 0..1
     bool ersDeploying = false;
     bool drsActive = false;
@@ -572,11 +665,13 @@ struct VehicleState {
     float frontDownforce = 0.f;
     float rearDownforce = 0.f;
     float dragForce = 0.f;
-    float damageTotal = 0.f;
     float wheelSpin = 0.f;  // visual wheel rotation [rad]
 };
 
-struct VehicleInput {
+// Driver intent. Written raw by the game / AI; Vehicle::Update runs it through
+// DriverControls (smoothing / counter-steer) before the components see it.
+// Aero areas are NOT here — they live in AeroKit (part health / DRS / X-Z).
+struct CarInput {
     float throttle = 0.f;
     float brake = 0.f;
     float steer = 0.f;
@@ -586,20 +681,226 @@ struct VehicleInput {
     bool drsZone = false;     // car is inside a map-marked DRS activation zone
     bool wingToggle = false;
     bool overtake = false;
-
-    // Effective aero areas [m^2] after game rules (damage, DRS, wing mode,
-    // pitch balance). Written by the game each substep; the engine only
-    // turns them into forces (q * A) — it never derives them from DRS /
-    // X-Mode / part health. Negative = unset: fall back to VehicleParams
-    // base areas + pitch split (unit tests that skip the game layer).
-    float dragArea = -1.f;
-    float frontDownforceArea = -1.f;
-    float rearDownforceArea = -1.f;
 };
 
+// Read-only chassis frame handed to components each substep.
+struct CarFrame {
+    IPhysicsWorld* world = nullptr;   // components may ApplyForce / Raycast
+    Transform chassis;
+    Vec3 velocity, angularVelocity;
+    Vec3 forward, right, up;   // +Z fwd, +X geometric-left, +Y up (vehicle frame)
+    float speed = 0.f, forwardSpeed = 0.f;
+    float dt = 0.f;
+};
+
+// Speed-sensitive full-lock road-wheel angle [deg]. Full lock sits at 1.2x the
+// kinematic grip angle delta = L * a_max(v) / v^2 (see Vehicle::SteerEnvelope).
+float SteerEnvelopeDeg(const VehicleParams& p, float speed);
+
+// ============================================================================
+// Car components. Each owns Params + State + Step; none touches L1 directly
+// except where the job is geometric (Suspension raycast, AeroKit reads frame).
+
+// --- Engine ---------------------------------------------------------------
+// Crank dynamics against a driveline load (I_c * dw = T_gas - T_fric - T_load)
+// with simplified combustion: intake lag, per-firing torque pulses, hysteretic
+// rev-limiter fuel cut, seeded misfire, idle governor. The crank owns its rpm;
+// the driven wheels are slaved to it through the current gear.
+class Engine {
+public:
+    struct State {
+        float rpm = 0.f;              // crank [rpm] (>= 0; floor prevents stall)
+        float omega = 0.f;            // crank [rad/s]
+        float firingPhase = 0.f;      // [0,1) within one firing interval (audio phase source)
+        float intakeFill = 0.f;       // throttle lag state [0..1]
+        bool fuelCut = false;
+        float ersCharge = 0.55f;
+        bool ersDeploying = false;
+    };
+
+    struct StepInput {
+        float throttle = 0.f;         // smoothed + assistance-cut throttle [0..1]
+        float loadTorque = 0.f;       // driveline load reflected to the crank [Nm]
+        float ersPower = 0.f;         // hybrid deploy power [W] -> crank torque
+        float inertia = 0.f;          // total effective inertia at the crank [kg m^2]
+        float dt = 0.f;
+    };
+
+    struct StepOutput {
+        float crankTorque = 0.f;      // net driveline torque (gas - friction + ers) [Nm]
+        float rpm = 0.f;
+        float firingPhase = 0.f;
+        bool fuelCut = false;
+        bool misfire = false;
+    };
+
+    void Init(const EngineParams& p) {
+        params_ = p;
+        st_ = State{};
+        st_.ersCharge = p.ersBaseCharge;
+        rng_ = p.misfireSeed;
+    }
+    // One crank step: intake lag -> fuel cut -> firing pulses/misfire -> idle
+    // governor -> integrate omega against the load.
+    StepOutput Step(const StepInput& in);
+    // ERS: deploy on overtake / regen under braking. Returns deploy power [W]
+    // (or 0) after updating charge. throttle/brake are the smoothed values.
+    float UpdateErc(const CarInput& intent, float throttle, float brake, float speed,
+                    bool overtakeEnabled, float dt);
+    // Rigid-driveline ratio change (gear shift): omega *= factor.
+    void Rescale(float factor);
+    const State& StateRef() const { return st_; }
+    void Reset();
+
+private:
+    float TorqueFactor() const;
+    float FrictionTorque(float throttleEff) const;
+    EngineParams params_;
+    State st_;
+    uint32_t rng_ = 0u;               // xorshift misfire rolls (seeded, deterministic)
+};
+
+// --- Transmission ----------------------------------------------------------
+// Gear ratios / final drive / shift logic + drive & brake split.
+class Transmission {
+public:
+    struct State { int gear = 1; float shiftTimer = 0.f; };  // gear 0 = reverse
+    struct Output {
+        std::array<float, 4> drivePerWheel{};
+        std::array<float, 4> brakePerWheel{};
+    };
+
+    void Init(const TransmissionParams& p) { params_ = p; st_ = State{}; }
+    // Shift logic + drive/brake split. `crankTorque` is the engine's net
+    // driveline torque (throttle-inclusive, engine braking included, ERS
+    // already added at the crank); the caller slaves the driven wheels to
+    // the crank through the current ratio. rearBrakeScale comes from
+    // assistance (ESC tail-brake reserve).
+    Output Compute(const CarInput& intent, float crankTorque, float rpm, float speed,
+                   float forwardSpeed, float wheelRadius, float rearBrakeScale, float dt);
+    const State& StateRef() const { return st_; }
+    void Reset();
+
+private:
+    TransmissionParams params_;
+    State st_;
+};
+
+// --- Suspension (front/rear) -----------------------------------------------
+// 4 raycast springs/dampers → per-corner load + contact. Front/rear params
+// independent. Also emits the simplified camber for the tire model.
+class Suspension {
+public:
+    struct Corner {
+        bool grounded = false;
+        float compression = 0.f, load = 0.f, suspensionLength = 0.f;
+        SurfaceType surface = SurfaceType::None;
+        Vec3 contactPoint, contactNormal, contactVelocity;
+    };
+    struct State { std::array<Corner, 4> corner; };
+
+    void Init(const SuspensionParams& p) { params_ = p; st_ = State{}; }
+    // Per-wheel raycast. hardpoints are chassis-local attach points; steerAngle
+    // [rad] rotates the front wheels. Fills camber[4] (rad) for the tire model.
+    void Step(const CarFrame& frame, BodyHandle chassis, float wheelRadius,
+              float trackWidth, float steerAngle, const std::array<Vec3, 4>& hardpoints,
+              float camber[4], float dt);
+    const State& StateRef() const { return st_; }
+    void Reset();
+
+private:
+    SuspensionParams params_;
+    State st_;
+};
+
+// --- Aero kit (front wing / rear wing / sidepods / floor) ------------------
+// Owns part health and the damage→area / DRS / X-Z / pitch rules — this was
+// the game-layer WriteVehicleAero.
+class AeroKit {
+public:
+    struct State {
+        float frontDownforce = 0.f, rearDownforce = 0.f, dragForce = 0.f;
+        std::array<float, 4> partHealth{1.f, 1.f, 1.f, 1.f};  // CarPart indexed
+    };
+    struct Output {
+        Vec3 cop;                      // drag application point (chassis space)
+        float frontDF = 0.f, rearDF = 0.f, drag = 0.f;
+    };
+
+    void Init(const AeroKitParams& p) { params_ = p; st_ = State{}; }
+    void ApplyDamage(CarPart part, float amount);
+    // damage→area / DRS / X-Z / pitch rules → aero forces (was WriteVehicleAero).
+    Output Compute(const CarFrame& frame, WingMode wingMode, bool drsActive);
+    float DamageTotal() const;
+    const State& StateRef() const { return st_; }
+    void Reset();
+
+private:
+    AeroKitParams params_;
+    State st_;
+};
+
+// --- Driver assistance (TCS / ESC / ABS) -----------------------------------
+// Modulates actuator requests from car state — NOT input processing.
+class DriverAssistance {
+public:
+    struct State { float escStrength = 0.f; };
+    struct Output {
+        float throttle = 0.f;        // post-TC cut
+        float steer = 0.f;           // post-ESC trim (rad)
+        float rearBrakeScale = 1.f;  // ESC tail-brake reserve
+        float tcDriveCap = 3.4e38f;  // traction budget for the driven axle
+        std::array<float, 4> absBrakeScale{1.f, 1.f, 1.f, 1.f};
+        Vec3 yawTorque;              // ESC yaw damping (world)
+        Vec3 lateralForce;           // ESC lateral damping (world)
+    };
+
+    void Init(const DriverAssistanceParams& p) { params_ = p; st_ = State{}; }
+    // wheels = previous substep state (slip ratios for TC/ABS). rearLoad is the
+    // driven-axle load for the TC traction budget.
+    Output Step(const CarInput& intent, const CarFrame& frame, float steerAngle,
+                const std::array<WheelState, 4>& wheels, float rearLoad,
+                const VehicleParams& p, float dt);
+    const State& StateRef() const { return st_; }
+    void Reset();
+
+private:
+    DriverAssistanceParams params_;
+    State st_;
+};
+
+// --- Driver controls (input processing — NOT a car component) --------------
+// Keyboard smoothing + counter-steer/anti-spin. Sits on the input→intent edge.
+class DriverControls {
+public:
+    struct State {
+        float steerAngle = 0.f;      // [rad] realized road-wheel angle
+        float throttleSmooth = 0.f;
+        float brakeSmooth = 0.f;
+        bool wingTogglePrev = false;
+    };
+    struct Output {
+        float throttle = 0.f, brake = 0.f;
+        float steer = 0.f;           // [rad] realized angle (see State)
+        bool handbrake = false, reverse = false;
+        bool drsRequest = false, drsZone = false, wingToggle = false, overtake = false;
+    };
+
+    void Init(const DriverControlsParams& p) { params_ = p; st_ = State{}; }
+    // Smooth raw input (keyboard easing) + counter-steer/anti-spin.
+    Output Process(const CarInput& raw, const CarFrame& frame, const VehicleParams& p);
+    void Reset();
+    const State& StateRef() const { return st_; }
+
+private:
+    DriverControlsParams params_;
+    State st_;
+};
+
+// ============================================================================
 // Chassis rigid body + 4 raycast-suspension wheels + combined-slip tires.
-// All physics goes through IPhysicsWorld so the collision backend is
-// replaceable (qu3e today, Jolt later).
+// Orchestrates the components; all physics goes through IPhysicsWorld so the
+// collision backend is replaceable (qu3e today, Jolt later).
 class Vehicle {
 public:
     Vehicle() = default;
@@ -608,9 +909,9 @@ public:
                void* userData = nullptr);
     void Despawn();
 
-    // One fixed physics substep. Applies suspension/tire/aero forces to the
-    // chassis body; the caller then steps the physics world.
-    void Update(const VehicleInput& input, float dt);
+    // One fixed physics substep. Orchestrates DriverControls → Suspension →
+    // Assistance → Powertrain → Tires → Aero, then applies the summed forces.
+    void Update(const CarInput& input, float dt);
 
     void ProcessContacts(const std::vector<ContactEvent>& contacts, float dt);
 
@@ -619,15 +920,13 @@ public:
     const VehicleState& State() const { return state_; }
     const VehicleParams& Params() const { return params_; }
     BodyHandle Chassis() const { return chassis_; }
+    // Part health lives in the aero kit (HUD / snapshot read it from here).
+    const AeroKit& Aero() const { return aero_; }
 
-    // Speed-sensitive full-lock road-wheel angle [deg]. Full lock sits at
-    // 1.2x the kinematic grip angle delta = L * a_max(v) / v^2 — the extra
-    // 20% covers the tire slip-angle headroom (L/R + understeer gradient) so
-    // the limit is reachable; the oversteer-gated assists catch anything past
-    // it. Derived from the tire / aero calibration, shared with the AI.
+    // Speed-sensitive full-lock road-wheel angle [deg] — shared with the AI.
     float SteerEnvelopeDeg(float speed) const;
     float PartHealth(CarPart part) const {
-        return state_.partHealth[static_cast<int>(part)];
+        return aero_.StateRef().partHealth[static_cast<int>(part)];
     }
 
     void Render(IRenderer& renderer, const Color& tint) const;
@@ -638,9 +937,6 @@ public:
                            const Color& tint);
 
 private:
-    void UpdatePowertrain(const VehicleInput& input, float dt);
-    void UpdateWheels(float dt);
-    void UpdateAssists(VehicleInput& input);
     void UpdateDamageFromContact(const ContactEvent& event);
 
     IPhysicsWorld* world_ = nullptr;
@@ -648,30 +944,27 @@ private:
     VehicleParams params_;
     VehicleState state_;
 
+    // Component assembly
+    Engine engine_;
+    Transmission gearbox_;
+    Suspension susp_;
+    AeroKit aero_;
+    DriverAssistance assists_;
+    DriverControls controls_;
     std::array<TireModel, 4> tires_;
+
     std::array<Vec3, 4> hardpoints_;  // suspension attach points in local space
 
-    // Powertrain
-    float engineRpm_ = 0.f;
-    int gear_ = 1;
-    float shiftTimer_ = 0.f;
-    float driveTorque_ = 0.f;
+    // Mode latch (edge on wingToggle) — orchestrated in Update().
+    bool wingTogglePrev_ = false;
 
-    // Input smoothing
-    float steerAngle_ = 0.f;
-    float throttleSmooth_ = 0.f;
-    float brakeSmooth_ = 0.f;
-
-    // ESC intervention state from UpdateAssists, consumed by UpdatePowertrain
-    // (rear brake reserve while cornering) and UpdateAssists itself.
-    float escStrength_ = 0.f;
-
-    // Per-wheel drive/brake force split (N), filled by UpdatePowertrain.
+    // Per-wheel drive/brake split (N), filled by Transmission each substep.
     std::array<float, 4> drivePerWheel_{};
     std::array<float, 4> brakePerWheel_{};
 
-    // Mode state
-    bool wingTogglePrev_ = false;
+    // Powertrain coupling state (engine <-> driveline).
+    float drivelineLoad_ = 0.f;  // reflected load the engine stepped against
+    int gearPrev_ = 1;           // last gear the crank was rescaled for
 
     // Visual-only wheel rotation (radians), accumulated from road speed.
     float wheelSpinAngle_ = 0.f;
