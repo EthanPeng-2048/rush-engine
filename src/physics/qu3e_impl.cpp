@@ -86,6 +86,16 @@ public:
         event.impactSpeed = std::max(0.f, Dot(rel, event.worldNormal));
         event.userDataA = const_cast<void*>(a->GetUserData());
         event.userDataB = const_cast<void*>(b->GetUserData());
+        // Shape tags: contact->A/B are the actual boxes (q3ContactConstraint
+        // exposes them). The tag rides on the box userdata as value + 1 so
+        // CarPart 0 (FrontWing) stays distinct from "no tag" (nullptr).
+        const auto tagOf = [](const q3Box* box) {
+            return box && box->GetUserdata()
+                       ? static_cast<int>(reinterpret_cast<uintptr_t>(box->GetUserdata())) - 1
+                       : -1;
+        };
+        event.partA = tagOf(contact->A);
+        event.partB = tagOf(contact->B);
         contacts.push_back(event);
     }
 
@@ -182,24 +192,52 @@ rush::Result<BodyHandle> Qu3eWorld::CreateBody(const BodyDesc& desc) {
     def.userData = desc.userData;
 
     q3Body* body = impl_->scene.CreateBody(def);
+    q3Box* firstBox = nullptr;
 
-    q3BoxDef boxDef;
-    q3Transform local;
-    q3Identity(local);
-    // q3BoxDef::Set takes FULL extents and halves them internally (q3Box.inl:
-    // m_e = extents * 0.5). Passing half-extents would shrink every collider
-    // by 2x (and mass by 8x).
-    boxDef.Set(local, ToQ3(desc.halfExtents * 2.f));
-    boxDef.SetFriction(desc.friction);
-    boxDef.SetRestitution(desc.restitution);
-    if (desc.mass > 0.f) {
-        boxDef.SetDensity(desc.mass / std::max(0.001f, 8.f * desc.halfExtents.x * desc.halfExtents.y *
-                                                            desc.halfExtents.z));
+    // Multi-shape composite: place every shape on the body and derive the
+    // density from mass / sum(volumes) so the total mass is exact. Legacy
+    // single-box path (empty shapes) keeps the old density formula.
+    if (!desc.shapes.empty()) {
+        float volume = 0.f;
+        for (const ShapeDesc& s : desc.shapes) {
+            volume += 8.f * s.halfExtents.x * s.halfExtents.y * s.halfExtents.z;
+        }
+        const float density =
+            desc.mass > 0.f ? desc.mass / std::max(0.001f, volume) : 0.f;
+        for (const ShapeDesc& s : desc.shapes) {
+            q3BoxDef boxDef;
+            boxDef.Set(ToQ3Transform(s.localTransform), ToQ3(s.halfExtents * 2.f));
+            boxDef.SetFriction(s.friction > 0.f ? s.friction : desc.friction);
+            boxDef.SetRestitution(desc.restitution);
+            if (desc.mass > 0.f) boxDef.SetDensity(density);
+            const q3Box* box = body->AddBox(boxDef);
+            // partTag + 1: CarPart 0 would otherwise be a nullptr tag.
+            box->SetUserdata(s.partTag >= 0
+                                 ? reinterpret_cast<void*>(static_cast<uintptr_t>(s.partTag) + 1u)
+                                 : nullptr);
+            impl_->boxToBody[box] = impl_->nextHandle;
+            if (!firstBox) firstBox = const_cast<q3Box*>(box);
+        }
+    } else {
+        q3BoxDef boxDef;
+        q3Transform local;
+        q3Identity(local);
+        // q3BoxDef::Set takes FULL extents and halves them internally (q3Box.inl:
+        // m_e = extents * 0.5). Passing half-extents would shrink every collider
+        // by 2x (and mass by 8x).
+        boxDef.Set(local, ToQ3(desc.halfExtents * 2.f));
+        boxDef.SetFriction(desc.friction);
+        boxDef.SetRestitution(desc.restitution);
+        if (desc.mass > 0.f) {
+            boxDef.SetDensity(desc.mass / std::max(0.001f, 8.f * desc.halfExtents.x * desc.halfExtents.y *
+                                                                desc.halfExtents.z));
+        }
+        const q3Box* box = body->AddBox(boxDef);
+        impl_->boxToBody[box] = impl_->nextHandle;
+        firstBox = const_cast<q3Box*>(box);
     }
-    const q3Box* box = body->AddBox(boxDef);
-    impl_->boxToBody[box] = impl_->nextHandle;
     impl_->bodies[impl_->nextHandle] = body;
-    impl_->bodyBoxes[impl_->nextHandle] = const_cast<q3Box*>(box);
+    impl_->bodyBoxes[impl_->nextHandle] = firstBox;
     return impl_->nextHandle++;
 }
 

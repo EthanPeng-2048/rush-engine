@@ -128,6 +128,15 @@ public:
         event.impactSpeed = std::max(0.f, Dot(rel, event.worldNormal));
         event.userDataA = const_cast<void*>(a->GetUserData());
         event.userDataB = const_cast<void*>(b->GetUserData());
+        // Shape tags: contact->A/B are the actual boxes, so the per-part tag
+        // rides on the box userdata (value + 1: CarPart 0 != "no tag").
+        const auto tagOf = [](const rpcBox* box) {
+            return box && box->GetUserdata()
+                       ? static_cast<int>(reinterpret_cast<uintptr_t>(box->GetUserdata())) - 1
+                       : -1;
+        };
+        event.partA = tagOf(contact->A);
+        event.partB = tagOf(contact->B);
         contacts.push_back(event);
     }
 
@@ -221,26 +230,55 @@ rush::Result<BodyHandle> RushPhysicsCore::CreateBody(const BodyDesc& desc) {
         EX_FAIL("rpc: scene.CreateBody returned null");
     }
 
-    rpcBoxDef boxDef;
-    rpcTransform local;
-    rpcIdentity(local);
-    // rpcBoxDef::Set takes FULL extents and halves them internally (rpcBox.inl:
-    // m_e = extents * 0.5). Passing half-extents would shrink every collider
-    // by 2x (and mass by 8x).
-    boxDef.Set(local, ToRpc(desc.halfExtents * 2.f));
-    boxDef.SetFriction(desc.friction);
-    boxDef.SetRestitution(desc.restitution);
-    if (desc.mass > 0.f) {
-        boxDef.SetDensity(desc.mass / std::max(0.001f, 8.f * desc.halfExtents.x * desc.halfExtents.y *
-                                                            desc.halfExtents.z));
+    rpcBox* firstBox = nullptr;
+    if (!desc.shapes.empty()) {
+        // Multi-shape composite: density = mass / sum(volumes) keeps the
+        // total mass exact; every shape carries its own part tag.
+        float volume = 0.f;
+        for (const ShapeDesc& s : desc.shapes) {
+            volume += 8.f * s.halfExtents.x * s.halfExtents.y * s.halfExtents.z;
+        }
+        const float density = desc.mass > 0.f ? desc.mass / std::max(0.001f, volume) : 0.f;
+        for (const ShapeDesc& s : desc.shapes) {
+            rpcBoxDef boxDef;
+            boxDef.Set(ToRpcTransform(s.localTransform), ToRpc(s.halfExtents * 2.f));
+            boxDef.SetFriction(s.friction > 0.f ? s.friction : desc.friction);
+            boxDef.SetRestitution(desc.restitution);
+            if (desc.mass > 0.f) boxDef.SetDensity(density);
+            const rpcBox* box = body->AddBox(boxDef);
+            if (!box) {
+                EX_FAIL("rpc: AddBox returned null");
+            }
+            // partTag + 1: CarPart 0 would otherwise be a nullptr tag.
+            box->SetUserdata(s.partTag >= 0
+                                 ? reinterpret_cast<void*>(static_cast<uintptr_t>(s.partTag) + 1u)
+                                 : nullptr);
+            impl_->boxToBody[box] = impl_->nextHandle;
+            if (!firstBox) firstBox = const_cast<rpcBox*>(box);
+        }
+    } else {
+        rpcBoxDef boxDef;
+        rpcTransform local;
+        rpcIdentity(local);
+        // rpcBoxDef::Set takes FULL extents and halves them internally (rpcBox.inl:
+        // m_e = extents * 0.5). Passing half-extents would shrink every collider
+        // by 2x (and mass by 8x).
+        boxDef.Set(local, ToRpc(desc.halfExtents * 2.f));
+        boxDef.SetFriction(desc.friction);
+        boxDef.SetRestitution(desc.restitution);
+        if (desc.mass > 0.f) {
+            boxDef.SetDensity(desc.mass / std::max(0.001f, 8.f * desc.halfExtents.x * desc.halfExtents.y *
+                                                                desc.halfExtents.z));
+        }
+        const rpcBox* box = body->AddBox(boxDef);
+        if (!box) {
+            EX_FAIL("rpc: AddBox returned null");
+        }
+        impl_->boxToBody[box] = impl_->nextHandle;
+        firstBox = const_cast<rpcBox*>(box);
     }
-    const rpcBox* box = body->AddBox(boxDef);
-    if (!box) {
-        EX_FAIL("rpc: AddBox returned null");
-    }
-    impl_->boxToBody[box] = impl_->nextHandle;
     impl_->bodies[impl_->nextHandle] = body;
-    impl_->bodyBoxes[impl_->nextHandle] = const_cast<rpcBox*>(box);
+    impl_->bodyBoxes[impl_->nextHandle] = firstBox;
     return impl_->nextHandle++;
 }
 

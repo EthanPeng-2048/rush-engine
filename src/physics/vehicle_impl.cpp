@@ -776,6 +776,40 @@ void Vehicle::Spawn(IPhysicsWorld& world, const Transform& pose, const VehiclePa
     desc.angularDamping = 0.25f;
     desc.allowSleep = false;
     desc.userData = userData;
+
+    // Composite collision layout (qu3e/rpc): one tagged box per CarPart plus
+    // the untagged main chassis box. The density is derived from the sum of
+    // volumes, so the total mass stays exactly `mass` and the inertia tensor
+    // follows the real distribution (wide flat body, overhanging wings).
+    // nudge ignores shapes and falls back to the single chassisHalf box.
+    const auto addBox = [&desc](const PartBoxDesc& b, int partTag) {
+        if (b.halfExtents.x <= 0.f || b.halfExtents.y <= 0.f || b.halfExtents.z <= 0.f) return;
+        ShapeDesc shape;
+        shape.localTransform.position = b.position;  // identity rotation
+        shape.halfExtents = b.halfExtents;
+        shape.partTag = partTag;
+        desc.shapes.push_back(shape);
+    };
+    for (int p = 0; p < static_cast<int>(CarPart::Count); ++p) {
+        if (p == static_cast<int>(CarPart::Sidepods)) {
+            // The sidepod entry describes the symmetric +/- offset; expand
+            // into two boxes sharing the Sidepods tag.
+            const PartBoxDesc& s = params.partBoxes[p];
+            if (s.halfExtents.x > 0.f && std::fabs(s.position.x) > 1e-4f) {
+                PartBoxDesc l = s, r = s;
+                l.position.x = -std::fabs(s.position.x);
+                r.position.x = std::fabs(s.position.x);
+                addBox(l, p);
+                addBox(r, p);
+            } else {
+                addBox(s, p);
+            }
+        } else {
+            addBox(params.partBoxes[p], p);
+        }
+    }
+    addBox(params.chassisBox, -1);  // main box: no part tag (fallback)
+
     chassis_ = world.CreateBody(desc).value_or(kInvalidBody);
 
     // Hardpoints: front axle at +wheelbase/2, rear at -wheelbase/2 (local +Z forward).
@@ -1135,11 +1169,20 @@ void Vehicle::UpdateDamageFromContact(const ContactEvent& event) {
     const bool wallHit = SurfaceFromTag(event.userDataA) == SurfaceType::Wall ||
                          SurfaceFromTag(event.userDataB) == SurfaceType::Wall;
 
+    // Part tag takes precedence: the tag belongs to THIS car's body (the
+    // contact's other side is a wall / ground / other car). Fall back to the
+    // coordinate regions when the backend reports no tag (nudge single box)
+    // or the hit landed on the untagged main chassis box.
     CarPart part;
-    if (local.z > 1.1f) part = CarPart::FrontWing;
-    else if (local.z < -1.15f) part = CarPart::RearWing;
-    else if (std::fabs(local.x) > 0.52f) part = CarPart::Sidepods;
-    else part = CarPart::Floor;
+    const int selfPart = (event.bodyA == chassis_) ? event.partA : event.partB;
+    if (selfPart >= 0 && selfPart < static_cast<int>(CarPart::Count)) {
+        part = static_cast<CarPart>(selfPart);
+    } else {
+        if (local.z > 1.1f) part = CarPart::FrontWing;
+        else if (local.z < -1.15f) part = CarPart::RearWing;
+        else if (std::fabs(local.x) > 0.52f) part = CarPart::Sidepods;
+        else part = CarPart::Floor;
+    }
 
     const float damage = speed01 * speed01 * (wallHit ? 0.70f : 0.55f);
     aero_.ApplyDamage(part, damage);

@@ -40,6 +40,16 @@ inline SurfaceType SurfaceFromTag(const void* tag) {
     return static_cast<SurfaceType>(reinterpret_cast<uintptr_t>(tag));
 }
 
+struct ShapeDesc {
+    Transform localTransform;      // pose relative to the body
+    Vec3 halfExtents{0.5f, 0.5f, 0.5f};
+    int partTag = -1;              // part label (CarPart value), -1 = none.
+                                   // Type-safe: CarPart 0 must not collide
+                                   // with "no tag" (void* 0 == nullptr).
+    void* userData = nullptr;      // arbitrary payload (unused by vehicles)
+    float friction = 0.f;          // 0 = inherit body friction
+};
+
 struct BodyDesc {
     Transform transform;
     Vec3 halfExtents{0.5f, 0.5f, 0.5f};
@@ -50,6 +60,10 @@ struct BodyDesc {
     float angularDamping = 0.05f;
     bool allowSleep = false;   // vehicles must never sleep
     void* userData = nullptr;
+    // Multi-shape (composite rigid body): empty = legacy single box
+    // (halfExtents). Non-empty backends place every shape on the body and
+    // derive mass/inertia from density * sum of volumes.
+    std::vector<ShapeDesc> shapes;
 };
 
 struct RayHit {
@@ -76,6 +90,9 @@ struct ContactEvent {
     float impactSpeed = 0.f;
     void* userDataA = nullptr;
     void* userDataB = nullptr;
+    // Shape tags of the boxes involved (partA belongs to bodyA's box,
+    // partB to bodyB's). -1 = unknown (legacy single-box / nudge backend).
+    int partA = -1, partB = -1;
 };
 
 // Generic Coulomb mix — same geometric-mean rule as q3/rpc/nudge contact
@@ -666,15 +683,34 @@ struct DriverControlsParams {
 
 // Complete parameter set for one car. Defaults approximate a 2026-spec F1
 // car at simcade level (Real Racing 3 / Monoposto feel).
+struct PartBoxDesc {
+    Vec3 position = {};          // local offset from the chassis origin
+    Vec3 halfExtents = {};       // box half size (0 = no box)
+};
+
 struct VehicleParams {
     // Chassis
     float mass = 750.f;               // kg
-    float chassisHalfX = 0.72f;       // half width [m]
-    float chassisHalfY = 0.22f;       // half height [m]
-    float chassisHalfZ = 1.85f;       // half length [m]
     float wheelbase = 3.60f;
     float trackWidth = 1.58f;
     float wheelRadius = 0.33f;
+
+    // Legacy single collision box (nudge backend / fallback; qu3e/rpc use
+    // the multi-box layout below when partBoxes is populated).
+    float chassisHalfX = 0.72f;       // half width [m]
+    float chassisHalfY = 0.22f;       // half height [m]
+    float chassisHalfZ = 1.85f;       // half length [m]
+
+    // Composite collision layout (qu3e/rpc): one box per CarPart plus the
+    // main chassis box. Sidepods position.x is the symmetric +/- offset.
+    // The main box carries no part tag (damage maps it via the fallback).
+    std::array<PartBoxDesc, 4> partBoxes{{
+        {{0.f, 0.06f, 1.68f}, {0.72f, 0.05f, 0.18f}},    // FrontWing
+        {{0.f, 0.62f, -1.66f}, {0.70f, 0.12f, 0.15f}},   // RearWing
+        {{0.70f, 0.20f, 0.f}, {0.14f, 0.16f, 1.05f}},    // Sidepods (L/R)
+        {{0.f, -0.02f, 0.5f}, {0.55f, 0.06f, 1.0f}},     // Floor
+    }};
+    PartBoxDesc chassisBox{{0.f, 0.15f, 0.f}, {0.58f, 0.18f, 1.35f}};
 
     // Tires (front = steering tire, rear = drive tire; see Params::Front/Rear)
     TireModel::Params frontTire = TireModel::Params::Front();
