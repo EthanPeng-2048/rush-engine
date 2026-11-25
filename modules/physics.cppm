@@ -207,6 +207,9 @@ public:
         double narrowphaseMs = 0.0;  // contact manifold generation
         double islandBuildMs = 0.0;  // island graph + solver setup
         double solveMs = 0.0;        // constraint iterations
+        double proxyMs = 0.0;        // per-shape AABB + index updates
+        double syncMs = 0.0;         // whole SyncAndFind (proxy + pairs + clears)
+        double pairMs = 0.0;         // pair generation (queries + sort + contacts)
         int contacts = 0;            // peak live contacts
         int contactPoints = 0;       // peak contact points
         int islands = 0;             // peak island count
@@ -406,6 +409,8 @@ private:
     // Stage-timing accumulators. ReadStageStats reports means over every step
     // since construction, so a quiet final substep cannot fake a zero report.
     double stageBroadMs_ = 0.0;
+    double stageProxyMs_ = 0.0;
+    double stagePairMs_ = 0.0;
     double stageNarrowMs_ = 0.0;
     double stageBuildMs_ = 0.0;
     double stageSolveMs_ = 0.0;

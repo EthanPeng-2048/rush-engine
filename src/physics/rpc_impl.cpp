@@ -332,6 +332,24 @@ void RushPhysicsCore::Step(float dt) {
     impl_->pendingForces.clear();
     (void)dt;  // rpcScene advances by the dt fixed at construction (1/240).
     impl_->scene.Step();
+
+    // Accumulate stage timings into means (the last substep alone is often
+    // empty, so a single-step report would read as zeros). Zero-cost when
+    // diagnostics are off: every field stays 0 and nothing is added.
+    const rpcScene::Stats& st = impl_->scene.GetStats();
+    if (st.narrowphaseMs > 0.0 || st.islandBuildMs > 0.0 || st.islandSolveMs > 0.0 ||
+        st.contacts > 0) {
+        stageBroadMs_ += st.broadphaseMs;
+        stageProxyMs_ += st.proxyMs;
+        stagePairMs_ += st.pairMs;
+        stageNarrowMs_ += st.narrowphaseMs;
+        stageBuildMs_ += st.islandBuildMs;
+        stageSolveMs_ += st.islandSolveMs;
+        ++stageSteps_;
+        if (st.contacts > stageContactsPeak_) stageContactsPeak_ = st.contacts;
+        if (st.contactPoints > stagePointsPeak_) stagePointsPeak_ = st.contactPoints;
+        if (st.islands > stageIslandsPeak_) stageIslandsPeak_ = st.islands;
+    }
     // Async: publish contacts to CollisionBus; consumers Drain on their stage.
     for (const ContactEvent& e : impl_->contacts) CollisionBus().Publish(e);
     impl_->contacts.clear();
@@ -579,7 +597,26 @@ void RushPhysicsCore::ReadStageStats(StageStats& out) const {
     out.contacts = s.contacts;
     out.contactPoints = s.contactPoints;
     out.islands = s.islands;
+    out.syncMs = s.syncMs;
+    out.proxyMs = s.proxyMs;
+    out.pairMs = s.pairMs;
     out.gridCells = impl_->scene.StaticGridCells();
+
+    // Report means over the whole run: a quiet final substep would otherwise
+    // read as zeros, and a single step is too noisy to tune against.
+    if (stageSteps_ > 0) {
+        const double steps = static_cast<double>(stageSteps_);
+        out.broadphaseMs = stageBroadMs_ / steps;
+        out.proxyMs = stageProxyMs_ / steps;
+        out.pairMs = stagePairMs_ / steps;
+        out.narrowphaseMs = stageNarrowMs_ / steps;
+        out.islandBuildMs = stageBuildMs_ / steps;
+        out.solveMs = stageSolveMs_ / steps;
+        out.contacts = stageContactsPeak_;
+        out.contactPoints = stagePointsPeak_;
+        out.islands = stageIslandsPeak_;
+        out.steps = stageSteps_;
+    }
 }
 
 // --- Contact friction / raycast: straight native forward into rpc* --------

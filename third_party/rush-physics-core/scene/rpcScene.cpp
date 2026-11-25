@@ -239,12 +239,11 @@ void rpcScene::SolveIslandsBatched( )
 
 		// island build (shared statics must re-join later islands), so they
 	// never leak across steps — clearing them here would walk 6000+ track
-	// bodies per step for nothing.
-	for ( rpcBody* body = m_bodyList; body; body = body->m_next )
-	{
-		if ( !( body->m_flags & rpcBody::eStatic ) )
-			body->m_flags &= ~rpcBody::eIsland;
-	}
+	// bodies per step for nothing. Iterate the dense dynamic list: walking
+	// m_bodyList would touch every static body's header (296 B apart, scattered
+	// by the heap) just to skip it — measured as ~0.1 ms/substep on a track.
+	for ( rpcBody* body : m_dynamicBodies )
+		body->m_flags &= ~rpcBody::eIsland;
 
 	// Island body lists are built one island at a time into the scratch
 	// buffers, then copied into the step pools at exact offsets. Only the
@@ -264,9 +263,11 @@ void rpcScene::SolveIslandsBatched( )
 
 	// Build every island and Initialize() right away: Initialize snapshots
 	// body->m_islandIndex, which a shared static body would overwrite if the
-	// islands were built first and initialized later.
+	// islands were built first and initialized later. Seeds come from the dense
+	// dynamic list — statics can never seed an island, so iterating them only
+	// costs cache misses walking the linked body list.
 	i32 islandCount = 0;
-	for ( rpcBody* seed = m_bodyList; seed; seed = seed->m_next )
+	for ( rpcBody* seed : m_dynamicBodies )
 	{
 		// Seed cannot be apart of an island already
 		if ( seed->m_flags & rpcBody::eIsland )
@@ -274,11 +275,6 @@ void rpcScene::SolveIslandsBatched( )
 
 		// Seed must be awake
 		if ( !(seed->m_flags & rpcBody::eAwake) )
-			continue;
-
-		// Seed cannot be a static body in order to keep islands
-		// as small as possible
-		if ( seed->m_flags & rpcBody::eStatic )
 			continue;
 
 		BuildAndAppendIsland( seed, islandCount );
@@ -534,25 +530,33 @@ void rpcScene::BuildIsland( rpcBody* seed, rpcIsland& island, rpcBody** stack, i
 //--------------------------------------------------------------------------------------------------
 void rpcScene::SyncAndFind( )
 {
-	// Update the broadphase AABBs
-	for ( rpcBody* body = m_bodyList; body; body = body->m_next )
-	{
-		if ( body->m_flags & rpcBody::eStatic )
-			continue;
+	StatsClock::time_point mark;
+	if ( m_statsEnabled )
+		mark = StatsClock::now( );
 
+	// Update the broadphase AABBs (dynamic bodies only; the dense list avoids
+	// touching every static body's cache line just to skip it).
+	for ( rpcBody* body : m_dynamicBodies )
 		body->SynchronizeProxies( );
+
+	if ( m_statsEnabled )
+	{
+		const StatsClock::time_point now = StatsClock::now( );
+		m_stats.proxyMs = ElapsedMs( mark, now );
+		mark = now;
 	}
 
 	// Look for new contacts
 	m_contactManager.FindNewContacts( );
 
+	if ( m_statsEnabled )
+		m_stats.pairMs = ElapsedMs( mark, StatsClock::now( ) );
+
 	// Clear all forces — dynamic bodies only: static bodies never receive
-	// forces (L2 applies forces to vehicles), so skipping them removes a
-	// 6000+ body walk from every step.
-	for ( rpcBody* body = m_bodyList; body; body = body->m_next )
+	// forces (L2 applies forces to vehicles), and the dense list keeps this
+	// walk off the static bodies' cache lines.
+	for ( rpcBody* body : m_dynamicBodies )
 	{
-		if ( body->m_flags & rpcBody::eStatic )
-			continue;
 		rpcIdentity( body->m_force );
 		rpcIdentity( body->m_torque );
 	}

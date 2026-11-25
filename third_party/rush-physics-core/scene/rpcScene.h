@@ -204,7 +204,9 @@ public:
 		double broadphaseMs;
 		double islandBuildMs;
 		double islandSolveMs;
-		double syncMs;
+		double syncMs;       // whole SyncAndFind (proxy + pairs + force clear)
+		double proxyMs;      // per-shape AABB + broadphase/ray-index updates
+		double pairMs;       // FindNewContacts (move-buffer queries + sort + contacts)
 		size_t poolContactStates;  // island-pool capacity, in states
 		size_t poolBytes;          // total reserved island-pool memory
 	};
