@@ -56,12 +56,30 @@ struct rpcBox
 	r32 restitution;
 	r32 density;
 	i32 broadPhaseIndex;
+	// Creation-order id (per scene, monotonic). Closest-hit selection breaks
+	// exact distance ties by it, so every ray strategy returns the same shape.
+	i32 uid;
+	// Leaf id inside the dynamic ray tree (rpcDynamicTreeRayIndex), -1 = not in it.
+	i32 rayIndexId;
 	mutable void* userData;
 	mutable bool sensor;
 
+	// Fattened world AABB, maintained by the owner (body/scene) on insert and
+	// on every move past the margin. Ray indexes and narrowphase pruning read
+	// it instead of recomputing an OBB AABB per query.
+	rpcAABB fatAABB;
+
 	void SetUserdata( void* data ) const;
 	void* GetUserdata( ) const;
+
+	// True when `local` carries no rotation: lets the hot world-transform path
+	// skip a 3x3 matrix multiply. Derived on demand — never cached, because
+	// `local` is also written directly by callers and by unit tests.
+	bool HasLocalRotation( ) const;
 	void SetSensor( bool isSensor );
+
+	// body transform (tx) composed with the shape's local transform.
+	rpcTransform WorldTransform( const rpcTransform& tx ) const;
 
 	bool TestPoint( const rpcTransform& tx, const rpcVec3& p ) const;
 	bool Raycast( const rpcTransform& tx, rpcRaycastData* raycast ) const;

@@ -6,6 +6,10 @@ project(rush-physics-core CXX)
 add_library(rush-physics-core STATIC
     broadphase/rpcBroadPhase.cpp
     broadphase/rpcDynamicAABBTree.cpp
+    broadphase/rpcDynamicSweep.cpp
+    broadphase/rpcDynamicTreeRayIndex.cpp
+    broadphase/rpcRayIndex.cpp
+    broadphase/rpcStaticGrid.cpp
     collision/rpcBox.cpp
     collision/rpcCollide.cpp
     common/rpcGeometry.cpp

@@ -49,10 +49,13 @@ private:
 
 	std::vector<std::thread> m_workers;
 	std::atomic<i32> m_quit{ 0 };
-	std::atomic<i32> m_seq{ 0 };        // batch generation; ++ on Run()
-	std::atomic<i32> m_nextTask{ -1 };  // next unclaimed task index
-	std::atomic<i32> m_tasksDone{ 0 };
-	std::atomic<i32> m_taskCount{ 0 };
+	// Hot counters get their own cache line: every worker hammers
+	// m_nextTask/m_tasksDone, and sharing one line turns a batch into a
+	// coherence ping-pong between the caller and every worker.
+	alignas(64) std::atomic<i32> m_seq{ 0 };        // batch generation; ++ on Run()
+	alignas(64) std::atomic<i32> m_nextTask{ -1 };  // next unclaimed task index
+	alignas(64) std::atomic<i32> m_tasksDone{ 0 };
+	alignas(64) std::atomic<i32> m_taskCount{ 0 };
 	void ( *m_fn )( i32, void* ) = nullptr;
 	void* m_arg = nullptr;
 };

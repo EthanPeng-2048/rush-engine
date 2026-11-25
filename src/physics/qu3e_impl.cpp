@@ -1,5 +1,6 @@
 module;
 #include <algorithm>
+#include <chrono>
 #include <map>
 #include <vector>
 #include <cstdint>
@@ -7,6 +8,7 @@ module;
 #include <memory>
 #include "q3.h"
 #include "dynamics/q3Contact.h"
+#include "raycast_probe.h"
 
 module rush.engine.physics;
 import rush.engine.core;
@@ -122,8 +124,10 @@ public:
     BodyHandle ignore = kInvalidBody;
     const std::map<const q3Box*, BodyHandle>* boxToBody = nullptr;
     RayHit result;
+    uint64_t leafTests = 0;  // TEMP probe
 
     bool ReportShape(q3Box* box) override {
+        ++leafTests;  // TEMP probe
         const auto it = boxToBody->find(box);
         if (it != boxToBody->end() && it->second == ignore) return true;
 
@@ -345,8 +349,18 @@ RayHit Qu3eWorld::Raycast(const Vec3& origin, const Vec3& direction, float maxDi
     callback.maxDistance = maxDistance;
     callback.ignore = ignore;
     callback.boxToBody = &impl_->boxToBody;
+    const auto t0 = std::chrono::steady_clock::now();  // TEMP probe
     impl_->scene.RayCast(&callback, ray);
+    Qu3eRaycastProbeAdd(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
+                        callback.leafTests);
     return callback.result;
+}
+
+void Qu3eWorld::RaycastBatch(const Vec3* origins, const Vec3& direction, float maxDistance,
+                             int count, BodyHandle ignore, RayHit* out) const {
+    // Interface obligation: stock qu3e has no batched traversal, so the
+    // batch is `count` single-ray queries with identical semantics.
+    for (int j = 0; j < count; ++j) out[j] = Raycast(origins[j], direction, maxDistance, ignore);
 }
 
 std::vector<ContactEvent> Qu3eWorld::DrainContacts() {

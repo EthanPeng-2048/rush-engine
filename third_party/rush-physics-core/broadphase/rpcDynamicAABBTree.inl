@@ -65,10 +65,15 @@ inline void rpcDynamicAABBTree::Query( T *cb, const rpcAABB& aabb ) const
 		i32 id = stack[ --sp ];
 
 		const Node *n = m_nodes + id;
+		++m_queryNodes;
+		++m_queryNodes;
+
 		if ( rpcAABBtoAABB( aabb, n->aabb ) )
 		{
 			if ( n->IsLeaf( ) )
 			{
+				++m_queryLeaves;
+
 				if ( !cb->TreeCallBack( id ) )
 					return;
 			}
@@ -106,6 +111,7 @@ void rpcDynamicAABBTree::Query( T *cb, rpcRaycastData& rayCast ) const
 			continue;
 
 		const Node *n = m_nodes + id;
+		++m_queryNodes;
 
 		rpcVec3 e = n->aabb.max - n->aabb.min;
 		rpcVec3 d = p1 - p0;
@@ -141,6 +147,8 @@ void rpcDynamicAABBTree::Query( T *cb, rpcRaycastData& rayCast ) const
 
 		if ( n->IsLeaf( ) )
 		{
+			++m_queryLeaves;
+
 			if ( !cb->TreeCallBack( id ) )
 				return;
 		}
@@ -149,6 +157,107 @@ void rpcDynamicAABBTree::Query( T *cb, rpcRaycastData& rayCast ) const
 		{
 			stack[ sp++ ] = n->left;
 			stack[ sp++ ] = n->right;
+		}
+	}
+}
+
+//--------------------------------------------------------------------------------------------------
+template <typename T>
+void rpcDynamicAABBTree::QueryBatch( T *cb, rpcRaycastData* rayCasts, i32 count ) const
+{
+	assert( count > 0 && count <= 32 );
+
+	const r32 k_epsilon = r32( 1.0e-6 );
+	const i32 k_stackCapacity = 256;
+	i32 stackId[ k_stackCapacity ];
+	u32 stackMask[ k_stackCapacity ];
+	i32 sp = 1;
+
+	stackId[ 0 ] = m_root;
+	stackMask[ 0 ] = 0xFFFFFFFFu;
+
+	// Endpoints at each ray's current t (per-ray closest-hit prune). The
+	// traversal never re-reads t, so visited nodes are a superset of the
+	// per-ray pruned walk — the box test in the leaf callback enforces t.
+	rpcVec3 p0[ 32 ];
+	rpcVec3 p1[ 32 ];
+	for ( i32 j = 0; j < count; ++j )
+	{
+		p0[ j ] = rayCasts[ j ].start;
+		p1[ j ] = p0[ j ] + rayCasts[ j ].dir * rayCasts[ j ].t;
+	}
+
+	while ( sp )
+	{
+		// k_stackCapacity too small
+		assert( sp < k_stackCapacity );
+
+		--sp;
+		const i32 id = stackId[ sp ];
+		const u32 mask = stackMask[ sp ];
+
+		if ( id == Node::Null )
+			continue;
+
+		const Node *n = m_nodes + id;
+		++m_queryNodes;
+
+		u32 childMask = 0;
+		for ( i32 j = 0; j < count; ++j )
+		{
+			if ( !( mask & ( u32( 1 ) << j ) ) )
+				continue;
+
+			const rpcVec3 e = n->aabb.max - n->aabb.min;
+			const rpcVec3 d = p1[ j ] - p0[ j ];
+			const rpcVec3 c = p0[ j ] + p1[ j ] - n->aabb.min - n->aabb.max;
+
+			const r32 adx = rpcAbs( d.x );
+			if ( rpcAbs( c.x ) > e.x + adx )
+				continue;
+
+			const r32 ady = rpcAbs( d.y );
+			if ( rpcAbs( c.y ) > e.y + ady )
+				continue;
+
+			const r32 adz = rpcAbs( d.z );
+			if ( rpcAbs( c.z ) > e.z + adz )
+				continue;
+
+			// The same slab test as the single-ray Query, epsilon included.
+			if ( rpcAbs( c.y * d.z - c.z * d.y ) > e.y * ( adz + k_epsilon ) + e.z * ( ady + k_epsilon ) )
+				continue;
+
+			if ( rpcAbs( c.z * d.x - c.x * d.z ) > e.x * ( adz + k_epsilon ) + e.z * ( adx + k_epsilon ) )
+				continue;
+
+			if ( rpcAbs( c.x * d.y - c.y * d.x ) > e.x * ( ady + k_epsilon ) + e.y * ( adx + k_epsilon ) )
+				continue;
+
+			childMask |= u32( 1 ) << j;
+		}
+
+		if ( childMask == 0 )
+			continue;
+
+		if ( n->IsLeaf( ) )
+		{
+			for ( i32 j = 0; j < count; ++j )
+			{
+				if ( !( childMask & ( u32( 1 ) << j ) ) )
+					continue;
+				if ( !cb->TreeCallBack( id, j ) )
+					return;
+			}
+		}
+		else
+		{
+			stackId[ sp ] = n->left;
+			stackMask[ sp ] = childMask;
+			++sp;
+			stackId[ sp ] = n->right;
+			stackMask[ sp ] = childMask;
+			++sp;
 		}
 	}
 }

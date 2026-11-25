@@ -98,8 +98,13 @@ void rpcContactSolver::PreSolve( r32 dt )
 				c->tangentMass[ i ] = rpcInvert( tm[ i ] );
 			}
 
-			// Precalculate bias factor
-			c->bias = -RPC_BAUMGARTE * (r32( 1.0 ) / dt) * rpcMin( r32( 0.0 ), c->penetration + RPC_PENETRATION_SLOP );
+			// Precalculate bias factor. The penetration depth that feeds the
+			// correction velocity is clamped to RPC_MAX_LINEAR_CORRECTION, so
+			// deep overlap (pile-up, overlapping spawn) resolves over several
+			// steps instead of ejecting the bodies at depth/dt.
+			const r32 pen = rpcMax( rpcMin( r32( 0.0 ), c->penetration + RPC_PENETRATION_SLOP ),
+			                        -RPC_MAX_LINEAR_CORRECTION );
+			c->bias = -RPC_BAUMGARTE * (r32( 1.0 ) / dt) * pen;
 
 			// Warm start contact
 			rpcVec3 P = cs->normal * c->normalImpulse;

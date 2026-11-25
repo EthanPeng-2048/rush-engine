@@ -89,6 +89,10 @@ rpcBody::rpcBody( const rpcBodyDef& def, rpcScene* scene )
 
 	m_boxes = NULL;
 	m_contactList = NULL;
+
+	// Empty accumulator: rpcIsEmpty() drives the first-union special case.
+	m_fatAabb.min = rpcVec3( RPC_R32_MAX, RPC_R32_MAX, RPC_R32_MAX );
+	m_fatAabb.max = rpcVec3( -RPC_R32_MAX, -RPC_R32_MAX, -RPC_R32_MAX );
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -108,10 +112,21 @@ const rpcBox* rpcBody::AddBox( const rpcBoxDef& def )
 	box->density = def.m_density;
 	box->sensor = def.m_sensor;
 
+	box->uid = m_scene->NextBoxUid( );
+	box->rayIndexId = -1;
+	box->fatAABB = rpcFatten( aabb );
+
 	CalculateMassData( );
 
 	m_scene->m_contactManager.m_broadphase.InsertBox( box, aabb );
+	m_scene->RegisterBoxProxy( box, box->fatAABB );
 	m_scene->m_newBox = true;
+
+	// Body proxy = union of its shapes (the dynamic ray sweep scans these).
+	if ( rpcIsEmpty( m_fatAabb ) )
+		m_fatAabb = box->fatAABB;
+	else
+		rpcUnion( m_fatAabb, box->fatAABB );
 
 	return box;
 }
@@ -164,8 +179,10 @@ void rpcBody::RemoveBox( const rpcBox* box )
 	}
 
 	m_scene->m_contactManager.m_broadphase.RemoveBox( box );
+	m_scene->UnregisterBoxProxy( (rpcBox*)box );
 
 	CalculateMassData( );
+	RefreshFatAabb( );
 
 	m_scene->m_heap.Free( (void*)box );
 }
@@ -178,12 +195,42 @@ void rpcBody::RemoveAllBoxes( )
 		rpcBox* next = m_boxes->next;
 
 		m_scene->m_contactManager.m_broadphase.RemoveBox( m_boxes );
+		m_scene->UnregisterBoxProxy( m_boxes );
 		m_scene->m_heap.Free( (void*)m_boxes );
 
 		m_boxes = next;
 	}
 
 	m_scene->m_contactManager.RemoveContactsFromBody( this );
+
+	m_fatAabb.min = rpcVec3( RPC_R32_MAX, RPC_R32_MAX, RPC_R32_MAX );
+	m_fatAabb.max = rpcVec3( -RPC_R32_MAX, -RPC_R32_MAX, -RPC_R32_MAX );
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcBody::RefreshFatAabb( )
+{
+	bool first = true;
+	rpcAABB out;
+
+	for ( rpcBox* box = m_boxes; box; box = box->next )
+	{
+		if ( first )
+		{
+			out = box->fatAABB;
+			first = false;
+		}
+		else
+			rpcUnion( out, box->fatAABB );
+	}
+
+	if ( first )
+	{
+		out.min = rpcVec3( RPC_R32_MAX, RPC_R32_MAX, RPC_R32_MAX );
+		out.max = rpcVec3( -RPC_R32_MAX, -RPC_R32_MAX, -RPC_R32_MAX );
+	}
+
+	m_fatAabb = out;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -608,12 +655,33 @@ void rpcBody::SynchronizeProxies( )
 
 	rpcAABB aabb;
 	rpcTransform tx = m_tx;
+	bool first = true;
+	rpcAABB bodyAabb;
 
 	rpcBox* box = m_boxes;
 	while ( box )
 	{
 		box->ComputeAABB( tx, &aabb );
-		broadphase->Update( box->broadPhaseIndex, aabb );
+		box->fatAABB = rpcFatten( aabb );
+
+		// One containment test drives both trees: they share the same fat AABB,
+		// so "the broadphase re-inserted it" is exactly "the ray index needs
+		// to". Skipping the second walk when the shape stayed inside its margin
+		// is most of the per-substep proxy cost at 480 Hz.
+		if ( broadphase->Update( box->broadPhaseIndex, aabb ) )
+			m_scene->UpdateBoxProxy( box, box->fatAABB );
+
+		if ( first )
+		{
+			bodyAabb = box->fatAABB;
+			first = false;
+		}
+		else
+			rpcUnion( bodyAabb, box->fatAABB );
+
 		box = box->next;
 	}
+
+	if ( !first )
+		m_fatAabb = bodyAabb;
 }

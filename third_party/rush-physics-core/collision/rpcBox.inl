@@ -65,3 +65,14 @@ inline void rpcBoxDef::SetSensor( bool sensor )
 {
 	m_sensor = sensor;
 }
+
+//--------------------------------------------------------------------------------------------------
+inline bool rpcBox::HasLocalRotation( ) const
+{
+	const r32 eps = r32( 1.0e-6 );
+	const rpcMat3& r = local.rotation;
+	return rpcAbs( r.ex.x - r32( 1.0 ) ) > eps || rpcAbs( r.ey.y - r32( 1.0 ) ) > eps ||
+	       rpcAbs( r.ez.z - r32( 1.0 ) ) > eps || rpcAbs( r.ex.y ) > eps || rpcAbs( r.ex.z ) > eps ||
+	       rpcAbs( r.ey.x ) > eps || rpcAbs( r.ey.z ) > eps || rpcAbs( r.ez.x ) > eps ||
+	       rpcAbs( r.ez.y ) > eps;
+}

@@ -33,11 +33,62 @@
 #include "../common/rpcSettings.h"
 #include "../common/rpcMemory.h"
 #include "../dynamics/rpcContactManager.h"
+#include "../broadphase/rpcRayIndex.h"
+
+//--------------------------------------------------------------------------------------------------
+// Which ray-query acceleration the scene uses.
+//   Tree    : the broadphase BVH (reference implementation, one tree for all)
+//   Indexed : static geometry in a uniform grid + dynamic bodies in a linear
+//             sweep (the shipped default; ~4x cheaper for suspension rays)
+//--------------------------------------------------------------------------------------------------
+enum class rpcRayStrategy
+{
+	Tree,
+	Indexed
+};
+
+// Dynamic-side accelerator used by the Indexed strategy.
+//   Sweep : linear scan over body proxy AABBs (wins with few dynamic bodies)
+//   Tree  : dedicated dynamic-only BVH (scales with the population)
+enum class rpcDynamicRay
+{
+	Sweep,
+	Tree
+};
+
+//--------------------------------------------------------------------------------------------------
+// rpcSceneConfig
+//--------------------------------------------------------------------------------------------------
+struct rpcSceneConfig
+{
+	rpcSceneConfig( r32 stepDt )
+		: dt( stepDt )
+		, gravity( r32( 0.0 ), r32( -9.81 ), r32( 0.0 ) )
+		, iterations( 20 )
+		, rayStrategy( rpcRayStrategy::Indexed )
+		, dynamicRay( rpcDynamicRay::Tree )
+		, staticGridCell( r32( 2.0 ) )
+		, rayFactory( nullptr )
+	{
+	}
+
+	r32 dt;
+	rpcVec3 gravity;
+	i32 iterations;
+	rpcRayStrategy rayStrategy;
+	rpcDynamicRay dynamicRay;   // dynamic-side accelerator (Indexed strategy)
+	r32 staticGridCell;   // metres per grid cell along X/Z
+	// Optional injection (tests / alternate accelerators). When set, it wins
+	// over `rayStrategy`; the scene takes ownership of what it creates.
+	rpcRayIndexFactory* rayFactory;
+};
 
 //--------------------------------------------------------------------------------------------------
 // rpcScene
 //--------------------------------------------------------------------------------------------------
 class rpcBody;
+class rpcStaticGrid;
+class rpcDynamicSweep;
 struct rpcBodyDef;
 struct rpcContactConstraint;
 struct rpcContactConstraintState;
@@ -78,12 +129,24 @@ public:
 	}
 
 	virtual bool ReportShape( rpcBox *box ) = 0;
+
+	// Batch-raycast callback: box, the ray index within the batch, and the
+	// ray's per-ray data (toi/normal freshly written by the box test). The
+	// default forwards to ReportShape( box ) so single-ray subclasses keep
+	// working unchanged.
+	virtual bool ReportShape( rpcBox *box, i32 rayIndex, rpcRaycastData* ray )
+	{
+		RPC_UNUSED( rayIndex );
+		RPC_UNUSED( ray );
+		return ReportShape( box );
+	}
 };
 
-class rpcScene
+class rpcScene : public rpcDynamicBodySource
 {
 public:
 	rpcScene( r32 dt, const rpcVec3& gravity = rpcVec3( r32( 0.0 ), r32( -9.8 ), r32( 0.0 ) ), i32 iterations = 20 );
+	explicit rpcScene( const rpcSceneConfig& config );
 	~rpcScene( );
 
 	// Run the simulation forward in time by dt (fixed timestep). Variable
@@ -128,6 +191,48 @@ public:
 	// the current simulation step.
 	void Render( rpcRender* render ) const;
 
+	// Per-step instrumentation for profiling and stress tests. Counts are
+	// cheap enough to maintain always; the timers only run when enabled, so
+	// gameplay pays nothing for this when it is off.
+	struct Stats
+	{
+		i32 contacts;
+		i32 contactPoints;
+		i32 islands;
+		i32 awakeBodies;
+		double narrowphaseMs;
+		double broadphaseMs;
+		double islandBuildMs;
+		double islandSolveMs;
+		double syncMs;
+		size_t poolContactStates;  // island-pool capacity, in states
+		size_t poolBytes;          // total reserved island-pool memory
+	};
+	void SetStatsEnabled( bool on ) { m_statsEnabled = on; }
+	// Deep counters walk every contact/body per step: tests and offline probes
+	// only, never the benchmark path.
+	void SetDeepStats( bool on ) { m_deepStats = on; }
+	const Stats& GetStats( ) const { return m_stats; }
+
+	// Broadphase tree shape/traversal counters (see rpcDynamicAABBTree).
+	const rpcDynamicAABBTree& BroadphaseTree( ) const { return m_contactManager.m_broadphase.m_tree; }
+
+	// rpcDynamicBodySource — population for the dynamic ray sweep.
+	rpcBody** Bodies( ) override { return m_dynamicBodies.data( ); }
+	i32 BodyCount( ) const override { return (i32)m_dynamicBodies.size( ); }
+
+	rpcRayStrategy RayStrategy( ) const { return m_rayStrategy; }
+	// Static ray-grid cell count (0 when the grid is not the active strategy).
+	i32 StaticGridCells( ) const { return m_staticRayIndex ? m_staticRayIndex->CellCount( ) : 0; }
+	// Monotonic per-scene shape id. Closest-hit selection breaks exact distance
+	// ties by it, so every ray strategy returns the same shape for the same ray.
+	i32 NextBoxUid( ) { return ++m_boxUidCounter; }
+	// Shape-proxy hooks (called by rpcBody): route insert/remove/move of a shape
+	// to the ray accelerator that owns it.
+	void RegisterBoxProxy( rpcBox* box, const rpcAABB& fatAabb );
+	void UnregisterBoxProxy( rpcBox* box );
+	void UpdateBoxProxy( rpcBox* box, const rpcAABB& fatAabb );
+
 	// Gets and sets the global gravity vector used during integration
 	const rpcVec3 GetGravity( ) const;
 	void SetGravity( const rpcVec3& gravity );
@@ -154,7 +259,14 @@ public:
 	void QueryPoint( rpcQueryCallback *cb, const rpcVec3& point ) const;
 
 	// Query the world to find any shapes intersecting a ray.
-	void RayCast( rpcQueryCallback *cb, rpcRaycastData& rayCast ) const;
+	void RayCast( rpcQueryCallback *cb, rpcRaycastData& rayCast, const rpcBody* ignore = nullptr ) const;
+
+	// Batch form of RayCast: `count` rays (<= 32) sharing one tree traversal.
+	// The callback sees ReportShape( box, rayIndex, ray ) per hit, so closest-
+	// hit selection can be tracked per ray. Results are identical to count
+	// separate RayCast calls; only the traversal is shared.
+	void RayCastBatch( rpcQueryCallback *cb, rpcRaycastData* rayCasts, i32 count,
+	                   const rpcBody* ignore = nullptr ) const;
 
 	// Dump all rigid bodies and shapes into a log file. The log can be
 	// used as C++ code to re-create an initial scene setup. Contacts
@@ -173,6 +285,25 @@ private:
 	// DFS the constraint graph from seed into the working island. Stack must
 	// hold at least m_bodyCount entries.
 	void BuildIsland( rpcBody* seed, rpcIsland& island, rpcBody** stack, i32 stackSize );
+
+	// Contact scan for the stats counter (never on the hot path when off).
+	void CollectStats( i32 islands );
+
+	// Island batch pools. Every island's body/contact lists are appended in
+	// island order at exact offsets, so the pools are sized to what the step
+	// actually built — never to islands × scene caps.
+	struct IslandSlice
+	{
+		size_t bodyFirst;
+		size_t bodyCount;
+		size_t contactFirst;
+		size_t contactCount;
+	};
+	void EnsureScratch( size_t bodies, size_t contacts );
+	void EnsurePools( size_t bodies, size_t contacts );
+	// (Re)attach an island's spans after a pool (re)allocation.
+	void PointIsland( i32 index );
+	void BuildAndAppendIsland( rpcBody* seed, i32 index );
 
 	rpcContactManager m_contactManager;
 	rpcPagedAllocator m_boxAllocator;
@@ -199,16 +330,36 @@ private:
 	bool m_parallelIslands;
 	rpcWorkerPool* m_workers;
 
-	// Island batch pools (contiguous, pre-sized to the scene caps): each
-	// island's spans slice into these, so solving allocates nothing, stays
-	// cache-friendly and owns no raw memory. Worst case = every dynamic body
-	// seeds its own island.
+	// Island batch pools (indexed by island, appended in build order). Each
+	// island's slices are exact: bodies/contacts are copied in from the build
+	// scratch, velocities/states are 1:1 work arrays.
 	std::vector<rpcBody*> m_poolBodies;
 	std::vector<rpcVelocityState> m_poolVelocities;
 	std::vector<rpcContactConstraint*> m_poolContacts;
 	std::vector<rpcContactConstraintState> m_poolContactStates;
 	std::vector<rpcIsland> m_islands;   // island slots (indexed by seed)
+	std::vector<IslandSlice> m_slices;  // per-island pool offsets
 	std::vector<rpcBody*> m_dfsStack;   // island-build DFS stack (reused)
+	// Build scratch: one island's lists at a time, reused across islands.
+	std::vector<rpcBody*> m_scratchBodies;
+	std::vector<rpcContactConstraint*> m_scratchContacts;
+
+	i32 m_boxUidCounter;   // monotonic shape id (closest-hit tie-break)
+	bool m_deepStats;      // opt-in expensive counters (contact points, awake)
+	bool m_statsEnabled;
+	Stats m_stats;
+
+	// Ray-query acceleration (see rpcRayStrategy). `Tree` keeps the historical
+	// single-BVH path; `Indexed` splits static geometry (grid) from dynamic
+	// bodies (linear sweep). Both are behind rpcRayIndex, so the query path
+	// never branches on the strategy at run time.
+	rpcRayStrategy m_rayStrategy;
+	rpcRayIndex* m_staticRayIndex;
+	rpcRayIndex* m_dynamicRayIndex;
+	std::vector<rpcBody*> m_dynamicBodies;   // sweep population (dense)
+
+	void InitRayIndexes( const rpcSceneConfig& config );
+	void ShutdownRayIndexes( );
 
 	friend class rpcBody;
 	friend void rpcSolveIslandTask( i32 index, void* arg );

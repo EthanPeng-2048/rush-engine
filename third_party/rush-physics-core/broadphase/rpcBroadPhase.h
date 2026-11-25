@@ -58,7 +58,9 @@ public:
 	// before generation occurs.
 	void UpdatePairs( void );
 
-	void Update( i32 id, const rpcAABB& aabb );
+	// Returns true when the proxy actually moved (its fat AABB was left), which
+	// is also the only case that cheapens/enables a ray-index update.
+	bool Update( i32 id, const rpcAABB& aabb );
 
 	bool TestOverlap( i32 A, i32 B ) const;
 

@@ -57,9 +57,28 @@ public:
 	void Query( T *cb, const rpcAABB& aabb ) const;
 	template <typename T>
 	void Query( T *cb, rpcRaycastData& rayCast ) const;
+	// Batch raycast: N rays (<= 32) tested against the tree in ONE traversal.
+	// Each ray keeps its own closest-hit state (start/dir/t); the callback is
+	// invoked as TreeCallBack( leafId, rayIndex ) per hit. Visits are a
+	// superset of N separate Query calls (no per-ray endpoint pruning), so
+	// results are identical but the traversal cost is paid once.
+	template <typename T>
+	void QueryBatch( T *cb, rpcRaycastData* rayCasts, i32 count ) const;
 
 	// For testing
 	void Validate( ) const;
+
+	// Traversal counters (accumulated since construction): node visits and leaf
+	// callbacks across every query. Used by the broadphase benchmarks to spot
+	// tree-shape regressions; the cost is one increment per visited node.
+	u64 QueryNodeVisits( ) const { return m_queryNodes; }
+	u64 QueryLeafVisits( ) const { return m_queryLeaves; }
+	void ResetQueryCounters( ) const { m_queryNodes = 0; m_queryLeaves = 0; }
+	// Branch/leaf counts of the live tree (root AABB + height help see how
+	// badly the fattening inflates the hierarchy).
+	i32 Count( ) const { return m_count; }
+	i32 Height( ) const;
+	const rpcAABB& RootAABB( ) const { return m_nodes[ m_root ].aabb; }
 
 private:
 	struct Node
@@ -118,6 +137,9 @@ private:
 	i32 m_count;	// Number of active nodes
 	i32 m_capacity;	// Max capacity of nodes
 	i32 m_freeList;
+
+	mutable u64 m_queryNodes;
+	mutable u64 m_queryLeaves;
 };
 
 #include "rpcDynamicAABBTree.inl"

@@ -30,9 +30,23 @@
 //--------------------------------------------------------------------------------------------------
 // rpcBox
 //--------------------------------------------------------------------------------------------------
+rpcTransform rpcBox::WorldTransform( const rpcTransform& tx ) const
+{
+	if ( !HasLocalRotation( ) )
+	{
+		rpcTransform world;
+		world.rotation = tx.rotation;
+		world.position = tx.position + rpcMul( tx.rotation, local.position );
+		return world;
+	}
+
+	return rpcMul( tx, local );
+}
+
+//--------------------------------------------------------------------------------------------------
 bool rpcBox::TestPoint( const rpcTransform& tx, const rpcVec3& p ) const
 {
-	rpcTransform world = rpcMul( tx, local );
+	rpcTransform world = WorldTransform( tx );
 	rpcVec3 p0 = rpcMulT( world, p );
 
 	for ( int i = 0; i < 3; ++i )
@@ -52,7 +66,7 @@ bool rpcBox::TestPoint( const rpcTransform& tx, const rpcVec3& p ) const
 //--------------------------------------------------------------------------------------------------
 bool rpcBox::Raycast( const rpcTransform& tx, rpcRaycastData* raycast ) const
 {
-	rpcTransform world = rpcMul( tx, local );
+	rpcTransform world = WorldTransform( tx );
 	rpcVec3 d = rpcMulT( world.rotation, raycast->dir );
 	rpcVec3 p = rpcMulT( world, raycast->start );
 	const r32 epsilon = r32( 1.0e-8 );
@@ -111,7 +125,7 @@ bool rpcBox::Raycast( const rpcTransform& tx, rpcRaycastData* raycast ) const
 //--------------------------------------------------------------------------------------------------
 void rpcBox::ComputeAABB( const rpcTransform& tx, rpcAABB* aabb ) const
 {
-	rpcTransform world = rpcMul( tx, local );
+	rpcTransform world = WorldTransform( tx );
 
 	// OBB AABB: center +/- |R| * e (absolute rotation columns times extents),
 	// equivalent to the 8-corner min/max at a fraction of the cost.

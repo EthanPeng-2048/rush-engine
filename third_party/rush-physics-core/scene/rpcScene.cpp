@@ -26,6 +26,8 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
+#include <chrono>
 
 #include "rpcScene.h"
 #include "../dynamics/rpcBody.h"
@@ -34,6 +36,20 @@
 #include "../dynamics/rpcContactSolver.h"
 #include "../collision/rpcBox.h"
 #include "../common/rpcWorkerPool.h"
+#include "../broadphase/rpcStaticGrid.h"
+#include "../broadphase/rpcDynamicSweep.h"
+#include "../broadphase/rpcDynamicTreeRayIndex.h"
+
+namespace {
+
+using StatsClock = std::chrono::steady_clock;
+
+double ElapsedMs( StatsClock::time_point from, StatsClock::time_point to )
+{
+	return std::chrono::duration<double, std::milli>( to - from ).count( );
+}
+
+}  // namespace
 
 //--------------------------------------------------------------------------------------------------
 // rpcScene
@@ -53,12 +69,113 @@ rpcScene::rpcScene( r32 dt, const rpcVec3& gravity, i32 iterations )
 	, m_enableFriction( true )
 	, m_parallelIslands( false )
 	, m_workers( NULL )
+	, m_boxUidCounter( 0 )
+	, m_deepStats( false )
+	, m_statsEnabled( false )
+	, m_stats( )
+	, m_rayStrategy( rpcRayStrategy::Tree )
+	, m_staticRayIndex( NULL )
+	, m_dynamicRayIndex( NULL )
 {
+	InitRayIndexes( rpcSceneConfig( dt ) );
+}
+
+//--------------------------------------------------------------------------------------------------
+rpcScene::rpcScene( const rpcSceneConfig& config )
+	: m_contactManager( &m_stack )
+	, m_boxAllocator( sizeof( rpcBox ), 256 )
+	, m_bodyCount( 0 )
+	, m_dynamicCount( 0 )
+	, m_contactPeak( 0 )
+	, m_bodyList( NULL )
+	, m_gravity( config.gravity )
+	, m_dt( config.dt )
+	, m_iterations( config.iterations )
+	, m_newBox( false )
+	, m_allowSleep( true )
+	, m_enableFriction( true )
+	, m_parallelIslands( false )
+	, m_workers( NULL )
+	, m_boxUidCounter( 0 )
+	, m_deepStats( false )
+	, m_statsEnabled( false )
+	, m_stats( )
+	, m_rayStrategy( config.rayStrategy )
+	, m_staticRayIndex( NULL )
+	, m_dynamicRayIndex( NULL )
+{
+	InitRayIndexes( config );
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcScene::InitRayIndexes( const rpcSceneConfig& config )
+{
+	ShutdownRayIndexes( );
+
+	// Injected accelerators take precedence: the scene only ever talks to the
+	// rpcRayIndex interface, so a different implementation changes nothing else.
+	if ( config.rayFactory )
+	{
+		m_rayStrategy = rpcRayStrategy::Indexed;
+		m_staticRayIndex = config.rayFactory->CreateStaticIndex( config.staticGridCell );
+		m_dynamicRayIndex = config.rayFactory->CreateDynamicIndex( this );
+		return;
+	}
+
+	if ( config.rayStrategy != rpcRayStrategy::Indexed )
+		return;
+
+	m_rayStrategy = rpcRayStrategy::Indexed;
+	m_staticRayIndex = new rpcStaticGrid( config.staticGridCell );
+	// Dynamic side: a dedicated BVH scales with the population; the linear sweep
+	// is kept as the alternative for small fields (see rpcDynamicRay). Measured
+	// on 120 cars: sweep cost grows ~linearly with the car count (0.95 us/ray at
+	// 24 cars -> 2.0 us/ray at 120), the dynamic tree stays near flat, which is
+	// why Tree is the default.
+	m_dynamicRayIndex = config.dynamicRay == rpcDynamicRay::Tree
+	                        ? static_cast<rpcRayIndex*>( new rpcDynamicTreeRayIndex( ) )
+	                        : static_cast<rpcRayIndex*>( new rpcDynamicSweep( this ) );
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcScene::ShutdownRayIndexes( )
+{
+	delete m_staticRayIndex;
+	delete m_dynamicRayIndex;
+	m_staticRayIndex = NULL;
+	m_dynamicRayIndex = NULL;
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcScene::RegisterBoxProxy( rpcBox* box, const rpcAABB& fatAabb )
+{
+	if ( m_rayStrategy == rpcRayStrategy::Indexed && m_staticRayIndex && box->body &&
+	     ( box->body->m_flags & rpcBody::eStatic ) )
+		m_staticRayIndex->Add( box, fatAabb );
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcScene::UnregisterBoxProxy( rpcBox* box )
+{
+	if ( m_staticRayIndex )
+		m_staticRayIndex->Remove( box );
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcScene::UpdateBoxProxy( rpcBox* box, const rpcAABB& fatAabb )
+{
+	// Only static geometry lives in the grid; dynamic bodies are enumerated by
+	// the sweep through rpcBody::GetFatAABB, so a moving dynamic shape costs
+	// nothing here. Static shapes are immutable after creation (the track is
+	// built once), which is what makes the grid a pure build-once structure.
+	if ( m_staticRayIndex && box->body && ( box->body->m_flags & rpcBody::eStatic ) )
+		m_staticRayIndex->Update( box, fatAabb );
 }
 
 //--------------------------------------------------------------------------------------------------
 rpcScene::~rpcScene( )
 {
+	ShutdownRayIndexes( );
 	Shutdown( );
 	// m_workers is the process-wide shared singleton (rpcWorkerPool::Shared)
 	// — it outlives every scene and must never be deleted here.
@@ -67,16 +184,40 @@ rpcScene::~rpcScene( )
 //--------------------------------------------------------------------------------------------------
 void rpcScene::Step( )
 {
+	StatsClock::time_point mark;
+	if ( m_statsEnabled )
+		mark = StatsClock::now( );
+
 	if ( m_newBox )
 	{
 		m_contactManager.m_broadphase.UpdatePairs( );
 		m_newBox = false;
 	}
 
+	if ( m_statsEnabled )
+	{
+		const StatsClock::time_point now = StatsClock::now( );
+		m_stats.broadphaseMs = ElapsedMs( mark, now );
+		mark = now;
+	}
+
 	m_contactManager.TestCollisions( );
+
+	if ( m_statsEnabled )
+	{
+		const StatsClock::time_point now = StatsClock::now( );
+		m_stats.narrowphaseMs = ElapsedMs( mark, now );
+		mark = now;
+	}
 
 	SolveIslands( );
 	SyncAndFind( );
+
+	if ( m_statsEnabled )
+	{
+		const StatsClock::time_point now = StatsClock::now( );
+		m_stats.syncMs = ElapsedMs( mark, now ) - m_stats.islandBuildMs - m_stats.islandSolveMs;
+	}
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -92,8 +233,11 @@ void rpcScene::SolveIslands( )
 //--------------------------------------------------------------------------------------------------
 void rpcScene::SolveIslandsBatched( )
 {
-	// Dynamic bodies only: static eIsland flags are reset right after each
-	// island build (shared statics must re-join later islands), so they
+	StatsClock::time_point mark;
+	if ( m_statsEnabled )
+		mark = StatsClock::now( );
+
+		// island build (shared statics must re-join later islands), so they
 	// never leak across steps — clearing them here would walk 6000+ track
 	// bodies per step for nothing.
 	for ( rpcBody* body = m_bodyList; body; body = body->m_next )
@@ -102,34 +246,21 @@ void rpcScene::SolveIslandsBatched( )
 			body->m_flags &= ~rpcBody::eIsland;
 	}
 
-	// Worst case: every DYNAMIC body seeds its own island — the static
-	// track bodies (thousands) must never size the batch pools, or the pools
-	// balloon into hundreds of megabytes and TLB-trash every step. Pools
-	// grow ×2 and never shrink; each island spans a contiguous slice written
-	// through span views, so steady-state solving allocates and clears
-	// nothing.
-	const size_t maxIslands = (size_t)rpcMax( 1, m_dynamicCount );
-	// Island body capacity: an island can hold every dynamic body plus the
-	// static bodies it touches (a static body appears in many islands), so
-	// cap at the full scene size — still cheap once maxIslands is small.
-	const size_t islandCap = (size_t)m_bodyCount;
-	// Contact pools size against the monotone contact peak, never the raw
-	// per-step count: the count jitters (240/334/274...) and a pool that
-	// reallocates on every step burns tens of microseconds of copies.
+	// Island body lists are built one island at a time into the scratch
+	// buffers, then copied into the step pools at exact offsets. Only the
+	// largest single island has to fit the scratch, so both buffers size
+	// against the scene itself.
 	m_contactPeak = rpcMax( m_contactPeak, m_contactManager.m_contactCount );
-	const size_t contactCap = (size_t)rpcMax( 1, m_contactPeak );
-	const auto growPool = []( auto& pool, size_t need ) {
-		if ( pool.capacity( ) < need )
-			pool.reserve( need * 2 );
-	};
-	growPool( m_poolBodies, maxIslands * islandCap );
-	growPool( m_poolVelocities, maxIslands * islandCap );
-	growPool( m_poolContacts, maxIslands * contactCap );
-	growPool( m_poolContactStates, maxIslands * contactCap );
-	if ( m_dfsStack.size( ) < islandCap )
-		m_dfsStack.resize( islandCap );
+	EnsureScratch( (size_t)m_bodyCount, (size_t)rpcMax( 1, m_contactPeak ) );
+	EnsurePools( 0, 0 );
+
+	const size_t maxIslands = (size_t)rpcMax( 1, m_dynamicCount );
+	if ( m_dfsStack.size( ) < (size_t)m_bodyCount )
+		m_dfsStack.resize( (size_t)m_bodyCount );
 	if ( m_islands.size( ) < maxIslands )
 		m_islands.resize( maxIslands );
+	if ( m_slices.size( ) < maxIslands )
+		m_slices.resize( maxIslands );
 
 	// Build every island and Initialize() right away: Initialize snapshots
 	// body->m_islandIndex, which a shared static body would overwrite if the
@@ -150,30 +281,15 @@ void rpcScene::SolveIslandsBatched( )
 		if ( seed->m_flags & rpcBody::eStatic )
 			continue;
 
-		const size_t slot = (size_t)islandCount;
-		rpcIsland& island = m_islands[ slot ];
-		island.Reset(
-			std::span<rpcBody*>( m_poolBodies.data( ) + slot * islandCap, islandCap ),
-			std::span<rpcVelocityState>( m_poolVelocities.data( ) + slot * islandCap, islandCap ),
-			std::span<rpcContactConstraint*>( m_poolContacts.data( ) + slot * contactCap, contactCap ),
-			std::span<rpcContactConstraintState>( m_poolContactStates.data( ) + slot * contactCap, contactCap ),
-			m_dt, m_gravity, m_iterations, m_allowSleep, m_enableFriction );
-
-		BuildIsland( seed, island, m_dfsStack.data( ), (i32)m_dfsStack.size( ) );
-
-		// Clear the static-body island flags right away: a shared static body
-		// (ground, walls) must be re-joinable by later islands, otherwise its
-		// m_islandIndex stays stale and Solve() indexes out of bounds. Keep
-		// Initialize() before the next island overwrites those indices.
-		for ( i32 i = 0; i < island.m_bodyCount; ++i )
-		{
-			rpcBody *body = island.m_bodies[ i ];
-			if ( body->m_flags & rpcBody::eStatic )
-				body->m_flags &= ~rpcBody::eIsland;
-		}
-		island.Initialize( );
-
+		BuildAndAppendIsland( seed, islandCount );
 		++islandCount;
+	}
+
+	if ( m_statsEnabled )
+	{
+		const StatsClock::time_point now = StatsClock::now( );
+		m_stats.islandBuildMs = ElapsedMs( mark, now );
+		mark = now;
 	}
 
 	// Solve all islands. Parallel and serial execution are bit-identical:
@@ -185,16 +301,161 @@ void rpcScene::SolveIslandsBatched( )
 	{
 		for ( i32 i = 0; i < islandCount; ++i )
 			m_islands[ (size_t)i ].Solve( );
-		return;
 	}
-	const i32 workers = (i32)m_workers->WorkerCount( ) + 1;
-	if ( islandCount < 4 * workers )
+	else
 	{
-		for ( i32 i = 0; i < islandCount; ++i )
-			m_islands[ (size_t)i ].Solve( );
-		return;
+		const i32 workers = (i32)m_workers->WorkerCount( ) + 1;
+		if ( islandCount < 4 * workers )
+		{
+			for ( i32 i = 0; i < islandCount; ++i )
+				m_islands[ (size_t)i ].Solve( );
+		}
+		else
+		{
+			m_workers->Run( rpcSolveIslandTask, this, islandCount );
+		}
 	}
-	m_workers->Run( rpcSolveIslandTask, this, islandCount );
+
+	if ( m_statsEnabled )
+	{
+		m_stats.islandSolveMs = ElapsedMs( mark, StatsClock::now( ) );
+		CollectStats( islandCount );
+	}
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcScene::CollectStats( i32 islands )
+{
+	i32 points = 0;
+	for ( const rpcContactConstraint* c = m_contactManager.m_contactList; c; c = c->next )
+	{
+		if ( c->m_flags & rpcContactConstraint::eColliding )
+			points += c->manifold.contactCount;
+	}
+
+	i32 awake = 0;
+	for ( rpcBody* body = m_bodyList; body; body = body->m_next )
+	{
+		if ( body->IsAwake( ) && !( body->m_flags & rpcBody::eStatic ) )
+			++awake;
+	}
+
+	m_stats.contacts = m_contactManager.m_contactCount;
+	m_stats.contactPoints = points;
+	m_stats.islands = islands;
+	m_stats.awakeBodies = awake;
+	m_stats.poolContactStates = m_poolContactStates.capacity( );
+	m_stats.poolBytes = m_poolContactStates.capacity( ) * sizeof( rpcContactConstraintState ) +
+	                    m_poolVelocities.capacity( ) * sizeof( rpcVelocityState ) +
+	                    m_poolBodies.capacity( ) * sizeof( rpcBody* ) +
+	                    m_poolContacts.capacity( ) * sizeof( rpcContactConstraint* );
+}
+
+//--------------------------------------------------------------------------------------------------
+// Pools grow ×2 and never shrink, so steady state allocates nothing. Growth
+// invalidates every island's spans, hence the re-point pass.
+void rpcScene::EnsureScratch( size_t bodies, size_t contacts )
+{
+	if ( m_scratchBodies.size( ) < bodies )
+		m_scratchBodies.resize( bodies );
+	if ( m_scratchContacts.size( ) < contacts )
+		m_scratchContacts.resize( contacts );
+}
+
+//--------------------------------------------------------------------------------------------------
+// Pools grow ×2 and never shrink, so steady state allocates nothing. Growth
+// invalidates every island's spans, hence the re-point pass. resize() (not
+// reserve()) keeps size() == usable length, so the span writes stay legal.
+void rpcScene::EnsurePools( size_t bodies, size_t contacts )
+{
+	bool moved = false;
+	const auto grow = [&moved]( auto& pool, size_t need ) {
+		if ( pool.size( ) < need )
+		{
+			pool.resize( need * 2 );
+			moved = true;
+		}
+	};
+	grow( m_poolBodies, bodies );
+	grow( m_poolVelocities, bodies );
+	grow( m_poolContacts, contacts );
+	grow( m_poolContactStates, contacts );
+
+	if ( !moved )
+		return;
+
+	// Every island built so far points into the old buffers: re-attach from
+	// the recorded offsets (contents survive the move).
+	for ( size_t i = 0; i < m_slices.size( ); ++i )
+	{
+		if ( m_slices[ i ].bodyCount == 0 && m_slices[ i ].contactCount == 0 )
+			continue;
+		PointIsland( (i32)i );
+	}
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcScene::PointIsland( i32 index )
+{
+	const IslandSlice& slice = m_slices[ (size_t)index ];
+	rpcIsland& island = m_islands[ (size_t)index ];
+	island.Reset( std::span<rpcBody*>( m_poolBodies.data( ) + slice.bodyFirst, slice.bodyCount ),
+	              std::span<rpcVelocityState>( m_poolVelocities.data( ) + slice.bodyFirst, slice.bodyCount ),
+	              std::span<rpcContactConstraint*>( m_poolContacts.data( ) + slice.contactFirst, slice.contactCount ),
+	              std::span<rpcContactConstraintState>( m_poolContactStates.data( ) + slice.contactFirst, slice.contactCount ),
+	              m_dt, m_gravity, m_iterations, m_allowSleep, m_enableFriction );
+	// Reset re-arms the counts; restore what the build already produced.
+	island.m_bodyCount = (i32)slice.bodyCount;
+	island.m_contactCount = (i32)slice.contactCount;
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcScene::BuildAndAppendIsland( rpcBody* seed, i32 index )
+{
+	// Build one island into the scratch buffers, then copy it into the step
+	// pools at the exact offset. Sizing the pools by islands × scene caps
+	// (the previous scheme) multiplied every pool by the dynamic-body count:
+	// a car pile-up with tens of thousands of contacts reserved gigabytes.
+	rpcIsland scratch;
+	scratch.Reset( std::span<rpcBody*>( m_scratchBodies.data( ), m_scratchBodies.size( ) ),
+	               std::span<rpcVelocityState>( ),
+	               std::span<rpcContactConstraint*>( m_scratchContacts.data( ), m_scratchContacts.size( ) ),
+	               std::span<rpcContactConstraintState>( ), m_dt, m_gravity, m_iterations,
+	               m_allowSleep, m_enableFriction );
+	BuildIsland( seed, scratch, m_dfsStack.data( ), (i32)m_dfsStack.size( ) );
+
+	const size_t bodyFirst = index == 0 ? 0 : m_slices[ (size_t)index - 1 ].bodyFirst +
+	                                             m_slices[ (size_t)index - 1 ].bodyCount;
+	const size_t contactFirst = index == 0 ? 0 : m_slices[ (size_t)index - 1 ].contactFirst +
+	                                                m_slices[ (size_t)index - 1 ].contactCount;
+	const size_t bodyCount = (size_t)scratch.m_bodyCount;
+	const size_t contactCount = (size_t)scratch.m_contactCount;
+
+	EnsurePools( bodyFirst + bodyCount, contactFirst + contactCount );
+
+	if ( bodyCount )
+		std::memcpy( m_poolBodies.data( ) + bodyFirst, scratch.m_bodies.data( ),
+		             bodyCount * sizeof( rpcBody* ) );
+	if ( contactCount )
+		std::memcpy( m_poolContacts.data( ) + contactFirst, scratch.m_contacts.data( ),
+		             contactCount * sizeof( rpcContactConstraint* ) );
+
+	m_slices[ (size_t)index ] = { bodyFirst, bodyCount, contactFirst, contactCount };
+	PointIsland( index );
+
+	rpcIsland& island = m_islands[ (size_t)index ];
+
+	// Clear the static-body island flags right away: a shared static body
+	// (ground, walls) must be re-joinable by later islands, otherwise its
+	// m_islandIndex stays stale and Solve() indexes out of bounds. Keep
+	// Initialize() before the next island overwrites those indices.
+	for ( i32 i = 0; i < island.m_bodyCount; ++i )
+	{
+		rpcBody* body = island.m_bodies[ i ];
+		if ( body->m_flags & rpcBody::eStatic )
+			body->m_flags &= ~rpcBody::eIsland;
+	}
+	island.Initialize( );
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -313,7 +574,10 @@ rpcBody* rpcScene::CreateBody( const rpcBodyDef& def )
 	m_bodyList = body;
 	++m_bodyCount;
 	if ( !( body->m_flags & rpcBody::eStatic ) )
+	{
 		++m_dynamicCount;
+		m_dynamicBodies.push_back( body );
+	}
 
 	return body;
 }
@@ -339,7 +603,18 @@ void rpcScene::RemoveBody( rpcBody* body )
 
 	--m_bodyCount;
 	if ( !( body->m_flags & rpcBody::eStatic ) )
+	{
 		--m_dynamicCount;
+		for ( size_t i = 0; i < m_dynamicBodies.size( ); ++i )
+		{
+			if ( m_dynamicBodies[ i ] == body )
+			{
+				m_dynamicBodies[ i ] = m_dynamicBodies.back( );
+				m_dynamicBodies.pop_back( );
+				break;
+			}
+		}
+	}
 
 	m_heap.Free( body );
 }
@@ -506,8 +781,18 @@ void rpcScene::QueryPoint( rpcQueryCallback *cb, const rpcVec3& point ) const
 }
 
 //--------------------------------------------------------------------------------------------------
-void rpcScene::RayCast( rpcQueryCallback *cb, rpcRaycastData& rayCast ) const
+void rpcScene::RayCast( rpcQueryCallback *cb, rpcRaycastData& rayCast, const rpcBody* ignore ) const
 {
+	// Indexed strategy: static geometry (grid) answers the common case — the
+	// suspension ray hits the road under the wheel — and its hit tightens
+	// rayCast.t before the dynamic pass, which then prunes against it.
+	if ( m_rayStrategy == rpcRayStrategy::Indexed && m_staticRayIndex && m_dynamicRayIndex )
+	{
+		m_staticRayIndex->Raycast( cb, rayCast );
+		m_dynamicRayIndex->Raycast( cb, rayCast );
+		return;
+	}
+
 	struct SceneQueryWrapper
 	{
 		bool TreeCallBack( i32 id )
@@ -532,6 +817,46 @@ void rpcScene::RayCast( rpcQueryCallback *cb, rpcRaycastData& rayCast ) const
 	wrapper.broadPhase = &m_contactManager.m_broadphase;
 	wrapper.cb = cb;
 	m_contactManager.m_broadphase.m_tree.Query( &wrapper, rayCast );
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcScene::RayCastBatch( rpcQueryCallback *cb, rpcRaycastData* rayCasts, i32 count,
+                            const rpcBody* ignore ) const
+{
+	if ( m_rayStrategy == rpcRayStrategy::Indexed && m_staticRayIndex && m_dynamicRayIndex )
+	{
+		// Each ray keeps its own closest-hit state, so the per-ray result stays
+		// identical to `count` separate RayCast calls; the sweep amortises its
+		// population walk across the whole batch.
+		m_staticRayIndex->RaycastBatch( cb, rayCasts, count );
+		m_dynamicRayIndex->RaycastBatch( cb, rayCasts, count );
+		return;
+	}
+
+	struct SceneQueryWrapper
+	{
+		bool TreeCallBack( i32 id, i32 rayIndex )
+		{
+			rpcBox *box = (rpcBox *)broadPhase->m_tree.GetUserData( id );
+
+			if ( box->Raycast( box->body->GetTransform( ), &rays[ rayIndex ] ) )
+			{
+				return cb->ReportShape( box, rayIndex, &rays[ rayIndex ] );
+			}
+
+			return true;
+		}
+
+		rpcQueryCallback *cb;
+		const rpcBroadPhase *broadPhase;
+		rpcRaycastData *rays;
+	};
+
+	SceneQueryWrapper wrapper;
+	wrapper.rays = rayCasts;
+	wrapper.broadPhase = &m_contactManager.m_broadphase;
+	wrapper.cb = cb;
+	m_contactManager.m_broadphase.m_tree.QueryBatch( &wrapper, rayCasts, count );
 }
 
 //--------------------------------------------------------------------------------------------------

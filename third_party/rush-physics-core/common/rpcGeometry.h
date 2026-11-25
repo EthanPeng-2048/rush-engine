@@ -42,7 +42,22 @@ struct rpcAABB
 	r32 SurfaceArea( ) const;
 };
 
+// Layout contract: the broadphase node, the ray indexes and the per-body proxy
+// all pack AABBs; growing this silently blows the cache budget of every query.
+static_assert( sizeof( rpcAABB ) == 24, "rpcAABB must stay two rpcVec3 (24 B)" );
+
 const rpcAABB rpcCombine( const rpcAABB& a, const rpcAABB& b );
+
+// Grow by RPC_AABB_MARGIN on every axis. The single definition of the broadphase
+// "fat" AABB: the tree, the ray indexes and the box proxies all use it, so a
+// shape is rejected by exactly the same bounds whichever strategy is active.
+rpcAABB rpcFatten( const rpcAABB& a );
+
+// In-place union (used to maintain per-body proxy bounds).
+void rpcUnion( rpcAABB& out, const rpcAABB& in );
+
+// True when the bounds contain no point (freshly reset accumulator).
+bool rpcIsEmpty( const rpcAABB& a );
 
 //--------------------------------------------------------------------------------------------------
 // rpcHalfSpace

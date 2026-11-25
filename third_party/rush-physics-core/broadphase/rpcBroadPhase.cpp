@@ -135,10 +135,13 @@ void rpcBroadPhase::UpdatePairs( )
 }
 
 //--------------------------------------------------------------------------------------------------
-void rpcBroadPhase::Update( i32 id, const rpcAABB& aabb )
+bool rpcBroadPhase::Update( i32 id, const rpcAABB& aabb )
 {
-	if ( m_tree.Update( id, aabb ) )
-		BufferMove( id );
+	if ( !m_tree.Update( id, aabb ) )
+		return false;
+
+	BufferMove( id );
+	return true;
 }
 
 //--------------------------------------------------------------------------------------------------

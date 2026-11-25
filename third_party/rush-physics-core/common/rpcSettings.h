@@ -41,4 +41,33 @@
 
 #define RPC_PENETRATION_SLOP r32( 0.05 )
 
+// Leaf margin added to every proxy AABB. Larger = fewer re-insertions but more
+// false overlaps (and a tree whose nodes overlap each other, which hurts every
+// query: a query must descend into every node the ray/AABB touches). 0.2 m
+// still covers a car's per-substep travel at 480 Hz (~0.15 m at 250 km/h).
+#define RPC_AABB_MARGIN r32( 0.2 )
+
+// Positional (Baumgarte) correction budget per step, in metres. Without this
+// cap a deep overlap — a pile-up, a car spawned inside another car — turns into
+// a correction *velocity* of depth/dt (hundreds of m/s at 480 Hz) and launches
+// the bodies. Box2D caps the same term with b2_maxLinearCorrection.
+#define RPC_MAX_LINEAR_CORRECTION r32( 0.2 )
+
+// Absolute velocity guards. A racing sim never needs these numbers; they exist
+// so a numerically degenerate step (bad manifold, huge restitution impulse)
+// cannot turn into a multi-kilometre launch or permanent NaN.
+#define RPC_MAX_LINEAR_VELOCITY r32( 150.0 )
+#define RPC_MAX_ANGULAR_VELOCITY r32( 80.0 )
+
+// Contact budget between two DYNAMIC bodies. Composite bodies (a car is made of
+// ~11 boxes) otherwise generate up to boxes(A) x boxes(B) manifolds per pair —
+// 121 for two cars — and every one of them is narrowphase + solver work. Capping
+// the pair keeps a pile-up's cost proportional to the number of touching pairs
+// instead of to the product of their box counts.
+// Dynamic-vs-static contacts (ground, walls) are never capped: they carry the
+// load path that keeps a car on the road.
+#define RPC_MAX_CONTACTS_PER_DYNAMIC_PAIR 12
+
+
+
 #endif // RPCSETTINGS_H

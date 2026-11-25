@@ -27,17 +27,14 @@
 #include "rpcDynamicAABBTree.h"
 #include "../debug/rpcRender.h"
 #include "../common/rpcMemory.h"
+#include "../common/rpcSettings.h"
 
 //--------------------------------------------------------------------------------------------------
 // rpcDynamicAABBTree
 //--------------------------------------------------------------------------------------------------
 inline void FattenAABB( rpcAABB& aabb )
 {
-	const r32 k_fattener = r32( 0.5 );
-	rpcVec3 v( k_fattener, k_fattener, k_fattener );
-
-	aabb.min -= v;
-	aabb.max += v;
+	aabb = rpcFatten( aabb );
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -48,8 +45,16 @@ rpcDynamicAABBTree::rpcDynamicAABBTree( )
 	m_capacity = 1024;
 	m_count = 0;
 	m_nodes = (Node *)rpcAlloc( sizeof( Node ) * m_capacity );
+	m_queryNodes = 0;
+	m_queryLeaves = 0;
 
 	AddToFreeList( 0 );
+}
+
+//--------------------------------------------------------------------------------------------------
+i32 rpcDynamicAABBTree::Height( ) const
+{
+	return m_root == Node::Null ? 0 : m_nodes[ m_root ].height;
 }
 
 //--------------------------------------------------------------------------------------------------

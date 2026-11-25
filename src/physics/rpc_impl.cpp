@@ -1,5 +1,6 @@
 module;
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <string>
 #include <unordered_map>
@@ -11,6 +12,7 @@ module;
 #include "rpc.h"
 #include "dynamics/rpcContact.h"
 #include "common/rpcWorkerPool.h"
+#include "raycast_probe.h"
 
 module rush.engine.physics;
 import rush.engine.core;
@@ -191,8 +193,11 @@ public:
     BodyHandle ignore = kInvalidBody;
     const std::unordered_map<const rpcBox*, BodyHandle>* boxToBody = nullptr;
     RayHit result;
+    i32 resultUid = 0x7fffffff;  // tie-break id of the current best hit
+    uint64_t leafTests = 0;  // TEMP probe
 
     bool ReportShape(rpcBox* box) override {
+        ++leafTests;  // TEMP probe
         const auto it = boxToBody->find(box);
         if (it != boxToBody->end() && it->second == ignore) return true;
 
@@ -202,8 +207,63 @@ public:
         // normal (rpcBox::Raycast never writes n0 when all entry t0 < 0), so
         // those hits are untrustworthy — skip them.
         if (t <= 0.f) return true;
-        if (!result.hit || t < ray->t) {
-            ray->t = t;  // prune anything farther than the best hit so far
+        // Closest hit, with exact distance ties broken by shape id: the answer
+        // must not depend on which ray strategy (tree / grid+sweep) replied.
+        const bool closer = !result.hit || t < ray->t - 1e-6f;
+        const bool tie = result.hit && std::fabs(t - ray->t) <= 1e-6f && box->uid < resultUid;
+        if (closer || tie) {
+            if (closer) ray->t = t;  // prune anything farther than the best hit
+            resultUid = box->uid;
+            result.hit = true;
+            result.point = FromRpc(ray->GetImpactPoint());
+            result.normal = FromRpc(ray->normal);
+            result.fraction = maxDistance > 1e-6f ? t / maxDistance : 0.f;
+            result.body = it != boxToBody->end() ? it->second : kInvalidBody;
+            result.userData = box->GetUserdata();
+            result.friction = box->friction;
+        }
+        return true;
+    }
+};
+
+// Per-ray closest-hit selection for the batch query. Each ray keeps its own
+// rpcRaycastData (the batch traversal writes per-ray toi/normal), so the
+// closest-hit prune applies to that ray alone.
+class BatchClosestHitCallback final : public rpcQueryCallback {
+public:
+    const rpcScene* scene = nullptr;
+    rpcRaycastData* rays = nullptr;
+    float maxDistance = 0.f;
+    BodyHandle ignore = kInvalidBody;
+    const std::unordered_map<const rpcBox*, BodyHandle>* boxToBody = nullptr;
+    RayHit results[32];
+    i32 resultUid[32];
+    uint64_t leafTests = 0;  // TEMP probe
+
+    bool ReportShape(rpcBox* box) override {
+        // The batch traversal always reports with the per-ray overload.
+        (void)box;
+        return true;
+    }
+
+    bool ReportShape(rpcBox* box, int rayIndex, rpcRaycastData* ray) override {
+        ++leafTests;  // TEMP probe
+        const auto it = boxToBody->find(box);
+        if (it != boxToBody->end() && it->second == ignore) return true;
+
+        // `ray->toi` / `ray->normal` were just written by the scene's test.
+        const float t = ray->toi;
+        // A ray that starts inside a box reports toi=0 with an uninitialized
+        // normal (rpcBox::Raycast never writes n0 when all entry t0 < 0), so
+        // those hits are untrustworthy — skip them.
+        if (t <= 0.f) return true;
+        RayHit& result = results[rayIndex];
+        // Closest hit per ray, ties broken by shape id (strategy-independent).
+        const bool closer = !result.hit || t < ray->t - 1e-6f;
+        const bool tie = result.hit && std::fabs(t - ray->t) <= 1e-6f && box->uid < resultUid[rayIndex];
+        if (closer || tie) {
+            if (closer) ray->t = t;  // prune anything farther than the best hit
+            resultUid[rayIndex] = box->uid;
             result.hit = true;
             result.point = FromRpc(ray->GetImpactPoint());
             result.normal = FromRpc(ray->normal);
@@ -221,7 +281,14 @@ public:
 RushPhysicsCore::RushPhysicsCore(float stepDt) : impl_(new Impl(stepDt)) {
     impl_->scene.SetContactListener(impl_.get());
     impl_->scene.SetAllowSleep(false);
-    impl_->scene.SetIterations(16);
+    // Solver budget scales with the substep rate: 16 iterations at 240 Hz, half
+    // that at 480 Hz, capped at 16 for slower rates (the smaller dt already
+    // improves convergence, so paying 32+ iterations at 120 Hz buys nothing).
+    // The cost per simulated second stays roughly constant while the
+    // per-substep cost — the one multiplied by the substep count — shrinks at
+    // high rates.
+    const float iters = 16.f * (stepDt * 240.f);
+    impl_->scene.SetIterations(std::clamp(static_cast<int>(std::lround(iters)), 4, 16));
 }
 
 RushPhysicsCore::~RushPhysicsCore() = default;
@@ -456,8 +523,36 @@ RayHit RushPhysicsCore::Raycast(const Vec3& origin, const Vec3& direction, float
     callback.maxDistance = maxDistance;
     callback.ignore = ignore;
     callback.boxToBody = &impl_->boxToBody;
-    impl_->scene.RayCast(&callback, ray);
+    const auto t0 = std::chrono::steady_clock::now();  // TEMP probe
+    impl_->scene.RayCast(&callback, ray, ignore == kInvalidBody ? nullptr : impl_->bodies.Get(ignore));
+    RpcRaycastProbeAdd(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
+                       callback.leafTests);
     return callback.result;
+}
+
+void RushPhysicsCore::RaycastBatch(const Vec3* origins, const Vec3& direction, float maxDistance,
+                                   int count, BodyHandle ignore, RayHit* out) const {
+    if (count <= 0) return;
+    assert(count <= 32);  // broadphase per-batch mask contract
+    // dir is normalized once — identical to `count` separate Raycast calls.
+    const rpcVec3 dir = ToRpc(Normalize(direction));
+    rpcRaycastData rays[32];
+    for (int j = 0; j < count; ++j) rays[j].Set(ToRpc(origins[j]), dir, maxDistance);
+
+    BatchClosestHitCallback callback;
+    callback.rays = rays;
+    callback.maxDistance = maxDistance;
+    callback.ignore = ignore;
+    callback.boxToBody = &impl_->boxToBody;
+    const auto t0 = std::chrono::steady_clock::now();  // TEMP probe
+    const u64 nodesBefore = impl_->scene.BroadphaseTree( ).QueryNodeVisits( );
+    impl_->scene.RayCastBatch(&callback, rays, count,
+                             ignore == kInvalidBody ? nullptr : impl_->bodies.Get(ignore));
+    const double nodes = static_cast<double>( impl_->scene.BroadphaseTree( ).QueryNodeVisits( ) - nodesBefore );
+    // Probe reports per-ray-equivalent numbers (amortized over count).
+    RpcRaycastProbeAdd(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / count,
+                       static_cast<double>(callback.leafTests) / count, nodes / count);
+    for (int j = 0; j < count; ++j) out[j] = callback.results[j];
 }
 
 std::vector<ContactEvent> RushPhysicsCore::DrainContacts() {
@@ -468,6 +563,23 @@ std::vector<ContactEvent> RushPhysicsCore::DrainContacts() {
 
 void RushPhysicsCore::SetParallelIslands(bool enabled) {
     impl_->scene.SetParallelIslands(enabled);
+}
+
+void RushPhysicsCore::SetDiagnostics(bool on) {
+    // Four clock reads per pass: only pay them when a consumer reads the report.
+    impl_->scene.SetStatsEnabled(on);
+}
+
+void RushPhysicsCore::ReadStageStats(StageStats& out) const {
+    const rpcScene::Stats& s = impl_->scene.GetStats();
+    out.broadphaseMs = s.broadphaseMs;
+    out.narrowphaseMs = s.narrowphaseMs;
+    out.islandBuildMs = s.islandBuildMs;
+    out.solveMs = s.islandSolveMs;
+    out.contacts = s.contacts;
+    out.contactPoints = s.contactPoints;
+    out.islands = s.islands;
+    out.gridCells = impl_->scene.StaticGridCells();
 }
 
 // --- Contact friction / raycast: straight native forward into rpc* --------

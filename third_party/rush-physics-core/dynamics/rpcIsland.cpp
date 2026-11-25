@@ -35,6 +35,26 @@
 //--------------------------------------------------------------------------------------------------
 // rpcIsland
 //--------------------------------------------------------------------------------------------------
+namespace {
+
+// Public setters on purpose: the clamp is a safety net, not part of the
+// solver's velocity write-back path.
+void ClampVelocity( rpcBody* body )
+{
+	const rpcVec3 v = body->GetLinearVelocity( );
+	const r32 v2 = rpcDot( v, v );
+	if ( v2 > RPC_MAX_LINEAR_VELOCITY * RPC_MAX_LINEAR_VELOCITY )
+		body->SetLinearVelocity( v * ( RPC_MAX_LINEAR_VELOCITY / std::sqrt( v2 ) ) );
+
+	const rpcVec3 w = body->GetAngularVelocity( );
+	const r32 w2 = rpcDot( w, w );
+	if ( w2 > RPC_MAX_ANGULAR_VELOCITY * RPC_MAX_ANGULAR_VELOCITY )
+		body->SetAngularVelocity( w * ( RPC_MAX_ANGULAR_VELOCITY / std::sqrt( w2 ) ) );
+}
+
+}  // namespace
+
+//--------------------------------------------------------------------------------------------------
 void rpcIsland::Reset( std::span<rpcBody*> bodies, std::span<rpcVelocityState> velocities,
                        std::span<rpcContactConstraint*> contacts,
                        std::span<rpcContactConstraintState> contactStates, r32 dt,
@@ -74,6 +94,12 @@ void rpcIsland::Solve( )
 			// Integrate velocity
 			body->m_linearVelocity += (body->m_force * body->m_invMass) * m_dt;
 			body->m_angularVelocity += (body->m_invInertiaWorld * body->m_torque) * m_dt;
+
+			// Guard rail: a degenerate step must never hand the game a body
+			// moving at kilometres per second — downstream code (track
+			// projection, HUD, render) has no defence against that, and the
+			// runaway body poisons whatever it touches next.
+			ClampVelocity( body );
 
 			// From Box2D!
 			// Apply damping.

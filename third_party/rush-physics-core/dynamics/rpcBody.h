@@ -31,6 +31,7 @@
 
 #include "../math/rpcMath.h"
 #include "../math/rpcTransform.h"
+#include "../common/rpcGeometry.h"
 
 //--------------------------------------------------------------------------------------------------
 // rpcBody
@@ -120,6 +121,13 @@ public:
 
 	r32 GetMass( ) const;
 	r32 GetInvMass( ) const;
+
+	// Union of the body's fat shape AABBs in world space. Maintained by
+	// SynchronizeProxies/AddBox; the dynamic ray sweep scans these (a few KB for
+	// a whole race, sequential memory) instead of walking a tree per ray.
+	const rpcAABB& GetFatAABB( ) const { return m_fatAabb; }
+	// Head of this body's shape list (read-only traversal for query accelerators).
+	rpcBox* GetBoxes( ) const { return m_boxes; }
 private:
 	// m_flags
 	enum
@@ -159,6 +167,7 @@ private:
 	rpcBody* m_next;
 	rpcBody* m_prev;
 	i32 m_islandIndex;
+	rpcAABB m_fatAabb;
 
 	r32 m_linearDamping;
 	r32 m_angularDamping;
@@ -175,6 +184,7 @@ private:
 
 	void CalculateMassData( );
 	void SynchronizeProxies( );
+	void RefreshFatAabb( );
 };
 
 //--------------------------------------------------------------------------------------------------

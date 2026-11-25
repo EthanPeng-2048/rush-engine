@@ -82,4 +82,8 @@ struct rpcContactSolver
 	bool m_enableFriction;
 };
 
+// The solver walks these arrays per iteration; the size is part of the
+// measured per-contact bandwidth budget (see docs/rpc-optimization.md).
+static_assert( sizeof( rpcContactState ) == 56, "rpcContactState size changed: re-check solver bandwidth" );
+
 #endif // RPCCONTACTSOLVER_H

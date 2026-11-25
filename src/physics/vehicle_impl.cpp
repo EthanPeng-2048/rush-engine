@@ -374,8 +374,15 @@ void Suspension::Step(const CarFrame& frame, BodyHandle chassis, float wheelRadi
                       float trackWidth, const std::array<Vec3, 4>& hardpoints, float camber[4],
                       float dt) {
     const Vec3 up = frame.up;
+    const float maxLen = params_.suspensionRestLength + params_.suspensionMaxTravel;
+    // All four wheel rays share direction and distance (only the hardpoint
+    // origins differ): one batch query = one broadphase traversal.
+    Vec3 origins[4];
+    for (int i = 0; i < 4; ++i) origins[i] = TransformPoint(frame.chassis, hardpoints[i]);
+    RayHit hits[4];
+    frame.world->RaycastBatch(origins, -up, maxLen + wheelRadius, 4, chassis, hits);
+
     for (int i = 0; i < 4; ++i) {
-        const Vec3 hardpoint = TransformPoint(frame.chassis, hardpoints[i]);
         // Static toe (front toeF, rear toeR) rotates the wheel frame around
         // the body up axis. Steer itself is applied by the orchestrator so
         // the ESC-corrected angle reaches the tire model.
@@ -388,8 +395,7 @@ void Suspension::Step(const CarFrame& frame, BodyHandle chassis, float wheelRadi
             wheelRight = Rotate(toeQ, frame.right);
         }
 
-        const float maxLen = params_.suspensionRestLength + params_.suspensionMaxTravel;
-        const RayHit hit = frame.world->Raycast(hardpoint, -up, maxLen + wheelRadius, chassis);
+        const RayHit& hit = hits[i];
 
         const float k = IsFront(i) ? params_.springKf : params_.springKr;
         const float c = IsFront(i) ? params_.damperCf : params_.damperCr;

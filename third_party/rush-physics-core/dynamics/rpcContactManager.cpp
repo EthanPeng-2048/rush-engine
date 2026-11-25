@@ -55,6 +55,9 @@ void rpcContactManager::AddContact( rpcBox *A, rpcBox *B )
 	// Search for existing matching contact
 	// Return if found duplicate to avoid duplicate constraints
 	// Mark pre-existing duplicates as active
+	const bool capPair = !( bodyA->m_flags & rpcBody::eStatic ) &&
+	                     !( bodyB->m_flags & rpcBody::eStatic );
+	i32 betweenBodies = 0;
 	rpcContactEdge* edge = A->body->m_contactList;
 	while ( edge )
 	{
@@ -65,6 +68,11 @@ void rpcContactManager::AddContact( rpcBox *A, rpcBox *B )
 
 			// @TODO: Verify this against Box2D; not sure if this is all we need here
 			if( (A == shapeA) && (B == shapeB) )
+				return;
+
+			// Dynamic pairs have a contact budget: stop at the cap so a pile-up
+			// of composite bodies cannot multiply manifolds per pair.
+			if ( capPair && ++betweenBodies >= RPC_MAX_CONTACTS_PER_DYNAMIC_PAIR )
 				return;
 		}
 

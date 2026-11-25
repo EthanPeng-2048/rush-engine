@@ -378,6 +378,13 @@ RayHit NudgeWorld::Raycast(const Vec3& origin, const Vec3& direction, float maxD
     return {};
 }
 
+void NudgeWorld::RaycastBatch(const Vec3* origins, const Vec3& direction, float maxDistance,
+                              int count, BodyHandle ignore, RayHit* out) const {
+    // Interface obligation: nudge's world_raycast has no batch form, so the
+    // batch is `count` single-ray queries with identical semantics.
+    for (int j = 0; j < count; ++j) out[j] = Raycast(origins[j], direction, maxDistance, ignore);
+}
+
 std::vector<ContactEvent> NudgeWorld::DrainContacts() {
     std::vector<ContactEvent> out;
     CollisionBus().Drain(out);

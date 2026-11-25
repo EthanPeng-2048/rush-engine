@@ -25,6 +25,36 @@
 //--------------------------------------------------------------------------------------------------
 
 #include "rpcGeometry.h"
+#include "rpcSettings.h"
+
+//--------------------------------------------------------------------------------------------------
+// rpcAABB helpers
+//--------------------------------------------------------------------------------------------------
+rpcAABB rpcFatten( const rpcAABB& a )
+{
+	const rpcVec3 v( RPC_AABB_MARGIN, RPC_AABB_MARGIN, RPC_AABB_MARGIN );
+	rpcAABB out;
+	out.min = a.min - v;
+	out.max = a.max + v;
+	return out;
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcUnion( rpcAABB& out, const rpcAABB& in )
+{
+	out.min.x = rpcMin( out.min.x, in.min.x );
+	out.min.y = rpcMin( out.min.y, in.min.y );
+	out.min.z = rpcMin( out.min.z, in.min.z );
+	out.max.x = rpcMax( out.max.x, in.max.x );
+	out.max.y = rpcMax( out.max.y, in.max.y );
+	out.max.z = rpcMax( out.max.z, in.max.z );
+}
+
+//--------------------------------------------------------------------------------------------------
+bool rpcIsEmpty( const rpcAABB& a )
+{
+	return a.min.x > a.max.x || a.min.y > a.max.y || a.min.z > a.max.z;
+}
 
 //--------------------------------------------------------------------------------------------------
 // rpcHalfSpace

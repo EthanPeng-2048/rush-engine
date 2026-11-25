@@ -181,6 +181,14 @@ public:
     virtual RayHit Raycast(const Vec3& origin, const Vec3& direction, float maxDistance,
                            BodyHandle ignore = kInvalidBody) const = 0;
 
+    // Batch raycast: `count` rays sharing one direction and maxDistance (the
+    // suspension hot path — 4 wheel hardpoints cast straight down). RPC
+    // traverses the broadphase once for all rays; qu3e/nudge loop the single-
+    // ray query. Same results as `count` Raycast calls; each `out[j]` holds
+    // that ray's closest hit (miss keeps hit == false). count <= 32.
+    virtual void RaycastBatch(const Vec3* origins, const Vec3& direction, float maxDistance,
+                              int count, BodyHandle ignore, RayHit* out) const = 0;
+
     // Contacts from the most recent Step(). Used for damage part mapping.
     virtual std::vector<ContactEvent> DrainContacts() = 0;
 
@@ -188,6 +196,26 @@ public:
     // to serial — only execution order changes. Default off: deterministic
     // paths (drive-test) never enable it. Other backends ignore the call.
     virtual void SetParallelIslands(bool enabled) { (void)enabled; }
+
+    // Per-stage cost, for benchmarks and tuning. Reported as MEANS over every
+    // Step() since construction (a quiet final substep would otherwise fake a
+    // zero report); peaks are reported separately. Backends that do not
+    // instrument themselves leave the default (steps == 0), which callers must
+    // read as "not available", never as "free".
+    struct StageStats {
+        double broadphaseMs = 0.0;   // proxy sync + pair generation
+        double narrowphaseMs = 0.0;  // contact manifold generation
+        double islandBuildMs = 0.0;  // island graph + solver setup
+        double solveMs = 0.0;        // constraint iterations
+        int contacts = 0;            // peak live contacts
+        int contactPoints = 0;       // peak contact points
+        int islands = 0;             // peak island count
+        int gridCells = 0;           // static ray-grid cells (0 = no grid)
+        long steps = 0;              // samples behind the means (0 = no data)
+    };
+    virtual void ReadStageStats(StageStats& out) const { (void)out; }
+    // Toggle the per-stage timers above (off by default: they cost clock reads).
+    virtual void SetDiagnostics(bool on) { (void)on; }
 
     // --- Contact friction / extended raycast ------------------------------
     // RPC forwards these straight to rush-physics-core. Qu3e/Nudge forward
@@ -246,6 +274,9 @@ public:
     RayHit Raycast(const Vec3& origin, const Vec3& direction, float maxDistance,
                    BodyHandle ignore) const override;
 
+    void RaycastBatch(const Vec3* origins, const Vec3& direction, float maxDistance, int count,
+                      BodyHandle ignore, RayHit* out) const override;
+
     std::vector<ContactEvent> DrainContacts() override;
 
     PhysicsCapability Capabilities() const override;
@@ -296,6 +327,9 @@ public:
 
     RayHit Raycast(const Vec3& origin, const Vec3& direction, float maxDistance,
                    BodyHandle ignore = kInvalidBody) const override;
+
+    void RaycastBatch(const Vec3* origins, const Vec3& direction, float maxDistance, int count,
+                      BodyHandle ignore, RayHit* out) const override;
 
     std::vector<ContactEvent> DrainContacts() override;
 
@@ -349,9 +383,14 @@ public:
     rush::Result<void> ApplyTorque(BodyHandle body, const Vec3& torque) override;
 
     void SetParallelIslands(bool enabled) override;
+    void ReadStageStats(StageStats& out) const override;
+    void SetDiagnostics(bool on) override;
 
     RayHit Raycast(const Vec3& origin, const Vec3& direction, float maxDistance,
                    BodyHandle ignore = kInvalidBody) const override;
+
+    void RaycastBatch(const Vec3* origins, const Vec3& direction, float maxDistance, int count,
+                      BodyHandle ignore, RayHit* out) const override;
 
     std::vector<ContactEvent> DrainContacts() override;
 
@@ -363,6 +402,17 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+
+    // Stage-timing accumulators. ReadStageStats reports means over every step
+    // since construction, so a quiet final substep cannot fake a zero report.
+    double stageBroadMs_ = 0.0;
+    double stageNarrowMs_ = 0.0;
+    double stageBuildMs_ = 0.0;
+    double stageSolveMs_ = 0.0;
+    long stageSteps_ = 0;
+    int stageContactsPeak_ = 0;
+    int stagePointsPeak_ = 0;
+    int stageIslandsPeak_ = 0;
 };
 
 
