@@ -127,11 +127,11 @@ void rpcScene::InitRayIndexes( const rpcSceneConfig& config )
 
 	m_rayStrategy = rpcRayStrategy::Indexed;
 	m_staticRayIndex = new rpcStaticGrid( config.staticGridCell );
-	// Dynamic side: a dedicated BVH scales with the population; the linear sweep
-	// is kept as the alternative for small fields (see rpcDynamicRay). Measured
-	// on 120 cars: sweep cost grows ~linearly with the car count (0.95 us/ray at
-	// 24 cars -> 2.0 us/ray at 120), the dynamic tree stays near flat, which is
-	// why Tree is the default.
+	// Dynamic side: a dedicated BVH scales with the population, the linear sweep
+	// is kept for small scenes and as the reference implementation. Note that a
+	// *populated* dynamic index costs real time — leaving dynamic shapes out of
+	// the query path entirely (the bug fixed alongside this comment) measured
+	// ~2x cheaper, but it silently made every ray blind to other vehicles.
 	m_dynamicRayIndex = config.dynamicRay == rpcDynamicRay::Tree
 	                        ? static_cast<rpcRayIndex*>( new rpcDynamicTreeRayIndex( ) )
 	                        : static_cast<rpcRayIndex*>( new rpcDynamicSweep( this ) );
@@ -147,29 +147,38 @@ void rpcScene::ShutdownRayIndexes( )
 }
 
 //--------------------------------------------------------------------------------------------------
+// Which ray index owns a shape: static geometry lives in the grid, dynamic
+// shapes in the moving index. Both are NULL under the Tree strategy, where the
+// broadphase BVH answers every ray and no per-shape proxy hook is needed.
+rpcRayIndex* rpcScene::RayIndexForBox( const rpcBox* box ) const
+{
+	if ( !box->body )
+		return NULL;
+	return ( box->body->m_flags & rpcBody::eStatic ) ? m_staticRayIndex : m_dynamicRayIndex;
+}
+
+//--------------------------------------------------------------------------------------------------
 void rpcScene::RegisterBoxProxy( rpcBox* box, const rpcAABB& fatAabb )
 {
-	if ( m_rayStrategy == rpcRayStrategy::Indexed && m_staticRayIndex && box->body &&
-	     ( box->body->m_flags & rpcBody::eStatic ) )
-		m_staticRayIndex->Add( box, fatAabb );
+	if ( rpcRayIndex* index = RayIndexForBox( box ) )
+		index->Add( box, fatAabb );
 }
 
 //--------------------------------------------------------------------------------------------------
 void rpcScene::UnregisterBoxProxy( rpcBox* box )
 {
-	if ( m_staticRayIndex )
-		m_staticRayIndex->Remove( box );
+	if ( rpcRayIndex* index = RayIndexForBox( box ) )
+		index->Remove( box );
 }
 
 //--------------------------------------------------------------------------------------------------
 void rpcScene::UpdateBoxProxy( rpcBox* box, const rpcAABB& fatAabb )
 {
-	// Only static geometry lives in the grid; dynamic bodies are enumerated by
-	// the sweep through rpcBody::GetFatAABB, so a moving dynamic shape costs
-	// nothing here. Static shapes are immutable after creation (the track is
-	// built once), which is what makes the grid a pure build-once structure.
-	if ( m_staticRayIndex && box->body && ( box->body->m_flags & rpcBody::eStatic ) )
-		m_staticRayIndex->Update( box, fatAabb );
+	// The body proxy sync already decided this shape left its margin (the same
+	// containment test drives the broadphase tree), so the owning index only
+	// has to re-file it.
+	if ( rpcRayIndex* index = RayIndexForBox( box ) )
+		index->Update( box, fatAabb );
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -187,6 +196,7 @@ void rpcScene::Step( )
 	StatsClock::time_point mark;
 	if ( m_statsEnabled )
 		mark = StatsClock::now( );
+	const StatsClock::time_point stepStart = mark;
 
 	if ( m_newBox )
 	{
@@ -216,6 +226,7 @@ void rpcScene::Step( )
 	if ( m_statsEnabled )
 	{
 		const StatsClock::time_point now = StatsClock::now( );
+		m_stats.stepMs = ElapsedMs( stepStart, now );
 		m_stats.syncMs = ElapsedMs( mark, now ) - m_stats.islandBuildMs - m_stats.islandSolveMs;
 	}
 }
@@ -322,6 +333,21 @@ void rpcScene::SolveIslandsBatched( )
 //--------------------------------------------------------------------------------------------------
 void rpcScene::CollectStats( i32 islands )
 {
+	// O(1) counters: safe to run every timed substep.
+	m_stats.contacts = m_contactManager.m_contactCount;
+	m_stats.islands = islands;
+	m_stats.poolContactStates = m_poolContactStates.capacity( );
+	m_stats.poolBytes = m_poolContactStates.capacity( ) * sizeof( rpcContactConstraintState ) +
+	                    m_poolVelocities.capacity( ) * sizeof( rpcVelocityState ) +
+	                    m_poolBodies.capacity( ) * sizeof( rpcBody* ) +
+	                    m_poolContacts.capacity( ) * sizeof( rpcContactConstraint* );
+
+	// Deep counters walk the contact list and every dynamic body — measured at
+	// ~0.12 ms/substep on a 120-car track, which would show up as time that no
+	// stage owns. Opt-in only (SetDeepStats), never on the benchmark path.
+	if ( !m_deepStats )
+		return;
+
 	i32 points = 0;
 	for ( const rpcContactConstraint* c = m_contactManager.m_contactList; c; c = c->next )
 	{
@@ -330,21 +356,14 @@ void rpcScene::CollectStats( i32 islands )
 	}
 
 	i32 awake = 0;
-	for ( rpcBody* body = m_bodyList; body; body = body->m_next )
+	for ( rpcBody* body : m_dynamicBodies )
 	{
-		if ( body->IsAwake( ) && !( body->m_flags & rpcBody::eStatic ) )
+		if ( body->IsAwake( ) )
 			++awake;
 	}
 
-	m_stats.contacts = m_contactManager.m_contactCount;
 	m_stats.contactPoints = points;
-	m_stats.islands = islands;
 	m_stats.awakeBodies = awake;
-	m_stats.poolContactStates = m_poolContactStates.capacity( );
-	m_stats.poolBytes = m_poolContactStates.capacity( ) * sizeof( rpcContactConstraintState ) +
-	                    m_poolVelocities.capacity( ) * sizeof( rpcVelocityState ) +
-	                    m_poolBodies.capacity( ) * sizeof( rpcBody* ) +
-	                    m_poolContacts.capacity( ) * sizeof( rpcContactConstraint* );
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -533,6 +552,7 @@ void rpcScene::SyncAndFind( )
 	StatsClock::time_point mark;
 	if ( m_statsEnabled )
 		mark = StatsClock::now( );
+	const StatsClock::time_point syncStart = mark;
 
 	// Update the broadphase AABBs (dynamic bodies only; the dense list avoids
 	// touching every static body's cache line just to skip it).
@@ -559,6 +579,11 @@ void rpcScene::SyncAndFind( )
 	{
 		rpcIdentity( body->m_force );
 		rpcIdentity( body->m_torque );
+	}
+	if ( m_statsEnabled )
+	{
+		m_stats.syncMs = ElapsedMs( syncStart, StatsClock::now( ) );
+		m_stats.forceMs = m_stats.syncMs - m_stats.proxyMs - m_stats.pairMs;
 	}
 }
 

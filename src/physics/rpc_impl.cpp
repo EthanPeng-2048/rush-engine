@@ -21,6 +21,12 @@ namespace apex {
 
 namespace {
 
+// Milliseconds between two steady-clock samples (diagnostics only).
+template <typename TimePoint>
+double secs(TimePoint from, TimePoint to) {
+    return std::chrono::duration<double, std::milli>(to - from).count();
+}
+
 rpcVec3 ToRpc(const Vec3& v) { return {v.x, v.y, v.z}; }
 Vec3 FromRpc(const rpcVec3& v) { return {v.x, v.y, v.z}; }
 
@@ -109,11 +115,56 @@ rush::Result<void> ValidateBodyDesc(const BodyDesc& desc) {
 
 }  // namespace
 
+// Sums buffered per-body impulses in O(1) per force. The previous version
+// scanned the already-aggregated list for every buffered force (O(bodies) per
+// force): ~11 forces per car made that ~0.13 ms per substep at 120 cars — a
+// fifth of the whole physics step, spent comparing pointers over a 24 B
+// struct. Handles are dense and never recycled, so the handle *is* the slot.
+class ImpulseAccumulator {
+public:
+    void Begin() {
+        if (++epoch_ == 0) {  // stamp wrap: start the table over
+            for (Slot& s : slots_) s.stamp = 0;
+            epoch_ = 1;
+        }
+        touched_.clear();
+    }
+
+    void Add(BodyHandle handle, const Vec3& linear, const Vec3& angular) {
+        if (handle >= slots_.size()) {
+            slots_.resize(std::max<size_t>(static_cast<size_t>(handle) + 1, slots_.size() * 2 + 1));
+        }
+        Slot& slot = slots_[handle];
+        if (slot.stamp != epoch_) {
+            slot.stamp = epoch_;
+            slot.linear = {};
+            slot.angular = {};
+            touched_.push_back(handle);
+        }
+        slot.linear += linear;
+        slot.angular += angular;
+    }
+
+    const std::vector<BodyHandle>& Touched() const { return touched_; }
+    const Vec3& Linear(BodyHandle handle) const { return slots_[handle].linear; }
+    const Vec3& Angular(BodyHandle handle) const { return slots_[handle].angular; }
+
+private:
+    struct Slot {
+        Vec3 linear;
+        Vec3 angular;
+        unsigned stamp = 0;
+    };
+    std::vector<Slot> slots_;
+    std::vector<BodyHandle> touched_;
+    unsigned epoch_ = 0;
+};
+
 // Captures contacts produced during the most recent scene step.
 struct RushPhysicsCore::Impl final : public rpcContactListener {
 public:
     struct PendingForce {
-        rpcBody* body = nullptr;  // resolved at ApplyForce; no second lookup
+        BodyHandle handle = 0;
         Vec3 force;
         Vec3 point;
     };
@@ -135,6 +186,7 @@ public:
     std::vector<ContactEvent> contacts;
     std::unordered_map<const rpcBox*, BodyHandle> boxToBody;
     std::vector<PendingForce> pendingForces;
+    ImpulseAccumulator impulses;
 
     void BeginContact(const rpcContactConstraint* contact) override {
         if (!contact || contact->manifold.contactCount <= 0) return;
@@ -296,55 +348,46 @@ RushPhysicsCore::~RushPhysicsCore() = default;
 void RushPhysicsCore::SetGravity(const Vec3& gravity) { impl_->scene.SetGravity(ToRpc(gravity)); }
 
 void RushPhysicsCore::Step(float dt) {
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point wrapStart = diag_ ? Clock::now() : Clock::time_point{};
     // Aggregate the buffered forces into one impulse application per body:
     // linear impulses sum directly, world angular impulses sum as well
     // (r x J), so each body pays one inertia application instead of ~11.
     // Mathematically identical; only the float summation order differs.
-    struct AggImpulse {
-        rpcBody* body;
-        Vec3 linear;
-        Vec3 angular;
-    };
-    std::vector<AggImpulse> agg;
-    // Pre-size so push_back never reallocates while slots are referenced.
-    agg.reserve(impl_->pendingForces.size());
+    impl_->impulses.Begin();
     for (const Impl::PendingForce& pf : impl_->pendingForces) {
         // Handle was validated in ApplyForce; drop if destroyed mid-frame.
-        if (!pf.body) continue;
-        size_t idx = agg.size();
-        for (size_t i = 0; i < agg.size(); ++i) {
-            if (agg[i].body == pf.body) {
-                idx = i;
-                break;
-            }
-        }
-        if (idx == agg.size()) agg.push_back({pf.body, Vec3{}, Vec3{}});
-        AggImpulse& slot = agg[idx];  // valid: capacity pre-sized above
+        rpcBody* body = impl_->bodies.Get(pf.handle);
+        if (!body) continue;
         const Vec3 j = pf.force * dt;
-        const Vec3 r = pf.point - FromRpc(pf.body->GetWorldCenter());
-        slot.linear += j;
-        slot.angular += Cross(r, j);
+        const Vec3 r = pf.point - FromRpc(body->GetWorldCenter());
+        impl_->impulses.Add(pf.handle, j, Cross(r, j));
     }
-    for (const AggImpulse& a : agg) {
-        a.body->ApplyLinearImpulse(ToRpc(a.linear));
-        a.body->ApplyAngularImpulse(ToRpc(a.angular));
+    for (const BodyHandle handle : impl_->impulses.Touched()) {
+        rpcBody* body = impl_->bodies.Get(handle);
+        body->ApplyLinearImpulse(ToRpc(impl_->impulses.Linear(handle)));
+        body->ApplyAngularImpulse(ToRpc(impl_->impulses.Angular(handle)));
     }
     impl_->pendingForces.clear();
     (void)dt;  // rpcScene advances by the dt fixed at construction (1/240).
+    const Clock::time_point sceneStart = diag_ ? Clock::now() : Clock::time_point{};
     impl_->scene.Step();
+    const Clock::time_point sceneEnd = diag_ ? Clock::now() : Clock::time_point{};
 
     // Accumulate stage timings into means (the last substep alone is often
     // empty, so a single-step report would read as zeros). Zero-cost when
     // diagnostics are off: every field stays 0 and nothing is added.
     const rpcScene::Stats& st = impl_->scene.GetStats();
-    if (st.narrowphaseMs > 0.0 || st.islandBuildMs > 0.0 || st.islandSolveMs > 0.0 ||
-        st.contacts > 0) {
+    if (diag_) {
         stageBroadMs_ += st.broadphaseMs;
         stageProxyMs_ += st.proxyMs;
         stagePairMs_ += st.pairMs;
         stageNarrowMs_ += st.narrowphaseMs;
         stageBuildMs_ += st.islandBuildMs;
         stageSolveMs_ += st.islandSolveMs;
+        stageForceMs_ += st.forceMs;
+        stageStepMs_ += st.stepMs;
+        stageSyncMs_ += st.syncMs;
         ++stageSteps_;
         if (st.contacts > stageContactsPeak_) stageContactsPeak_ = st.contacts;
         if (st.contactPoints > stagePointsPeak_) stagePointsPeak_ = st.contactPoints;
@@ -353,6 +396,10 @@ void RushPhysicsCore::Step(float dt) {
     // Async: publish contacts to CollisionBus; consumers Drain on their stage.
     for (const ContactEvent& e : impl_->contacts) CollisionBus().Publish(e);
     impl_->contacts.clear();
+    if (diag_) {
+        const Clock::time_point wrapEnd = Clock::now();
+        stageWrapMs_ += secs(wrapStart, sceneStart) + secs(sceneEnd, wrapEnd);
+    }
 }
 
 rush::Result<BodyHandle> RushPhysicsCore::CreateBody(const BodyDesc& desc) {
@@ -436,12 +483,8 @@ rush::Result<void> RushPhysicsCore::DestroyBody(BodyHandle handle) {
         boxIt != impl_->bodyBoxes.end() && boxIt->second) {
         impl_->boxToBody.erase(boxIt->second);
     }
-    // Pending forces hold pre-resolved body pointers; purge this body's
-    // entries so Step() can never touch a destroyed body.
-    for (auto it = impl_->pendingForces.begin(); it != impl_->pendingForces.end();) {
-        if (it->body == *body) it = impl_->pendingForces.erase(it);
-        else ++it;
-    }
+    // Buffered forces are keyed by handle, and the handle table entry is
+    // cleared below, so Step() skips this body's forces without a purge pass.
     impl_->scene.RemoveBody(*body);
     impl_->bodies.Erase(handle);
     impl_->bodyBoxes.erase(handle);
@@ -510,9 +553,10 @@ rush::Result<void> RushPhysicsCore::ApplyForce(BodyHandle handle, const Vec3& fo
     // treats its argument as a mass-scaled acceleration (m_force += force *
     // mass) while leaving the torque term unscaled, so passing Newtons makes
     // linear response mass-independent and explodes. Impulses have clean
-    // semantics on both axes. Hot path (~11x per substep): unchecked fast
-    // lookup; Step() applies the pre-resolved pointer without a second one.
-    impl_->pendingForces.push_back({FindBodyFast(impl_->bodies, handle), force, worldPoint});
+    // semantics on both axes. Hot path (~11x per substep per car): buffer the
+    // handle only — resolving the body here would be a lookup Step() has to
+    // repeat anyway to aggregate by body.
+    impl_->pendingForces.push_back({handle, force, worldPoint});
     return {};
 }
 
@@ -584,8 +628,17 @@ void RushPhysicsCore::SetParallelIslands(bool enabled) {
 }
 
 void RushPhysicsCore::SetDiagnostics(bool on) {
-    // Four clock reads per pass: only pay them when a consumer reads the report.
+    // Only when a consumer reads the report do we pay for the clock reads.
+    diag_ = on;
     impl_->scene.SetStatsEnabled(on);
+}
+
+void RushPhysicsCore::ResetStageStats() {
+    stageBroadMs_ = stageProxyMs_ = stagePairMs_ = stageSyncMs_ = 0.0;
+    stageNarrowMs_ = stageBuildMs_ = stageSolveMs_ = stageForceMs_ = 0.0;
+    stageStepMs_ = stageWrapMs_ = 0.0;
+    stageSteps_ = 0;
+    stageContactsPeak_ = stagePointsPeak_ = stageIslandsPeak_ = 0;
 }
 
 void RushPhysicsCore::ReadStageStats(StageStats& out) const {
@@ -609,6 +662,10 @@ void RushPhysicsCore::ReadStageStats(StageStats& out) const {
         out.broadphaseMs = stageBroadMs_ / steps;
         out.proxyMs = stageProxyMs_ / steps;
         out.pairMs = stagePairMs_ / steps;
+        out.forceMs = stageForceMs_ / steps;
+        out.stepMs = stageStepMs_ / steps;
+        out.wrapMs = stageWrapMs_ / steps;
+        out.syncMs = stageSyncMs_ / steps;
         out.narrowphaseMs = stageNarrowMs_ / steps;
         out.islandBuildMs = stageBuildMs_ / steps;
         out.solveMs = stageSolveMs_ / steps;

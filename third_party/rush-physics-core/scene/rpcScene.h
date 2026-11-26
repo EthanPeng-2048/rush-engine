@@ -207,6 +207,8 @@ public:
 		double syncMs;       // whole SyncAndFind (proxy + pairs + force clear)
 		double proxyMs;      // per-shape AABB + broadphase/ray-index updates
 		double pairMs;       // FindNewContacts (move-buffer queries + sort + contacts)
+		double forceMs;      // clearing per-body force/torque accumulators
+		double stepMs;       // whole Step() — closes the accounting against the sum
 		size_t poolContactStates;  // island-pool capacity, in states
 		size_t poolBytes;          // total reserved island-pool memory
 	};
@@ -234,6 +236,8 @@ public:
 	void RegisterBoxProxy( rpcBox* box, const rpcAABB& fatAabb );
 	void UnregisterBoxProxy( rpcBox* box );
 	void UpdateBoxProxy( rpcBox* box, const rpcAABB& fatAabb );
+	// Ray index that owns a shape (static → grid, dynamic → moving index).
+	rpcRayIndex* RayIndexForBox( const rpcBox* box ) const;
 
 	// Gets and sets the global gravity vector used during integration
 	const rpcVec3 GetGravity( ) const;

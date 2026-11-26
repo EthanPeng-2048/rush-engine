@@ -81,13 +81,14 @@ public:
     void Remove(rpcBox* box) override { m_inner->Remove(box); }
     void Update(rpcBox* box, const rpcAABB& aabb) override { m_inner->Update(box, aabb); }
     void Clear() override { m_inner->Clear(); }
-    void Raycast(rpcQueryCallback* cb, rpcRaycastData& ray) const override {
+    void Raycast(rpcQueryCallback* cb, rpcRaycastData& ray, const rpcBody* ignore) const override {
         ++raycastCount;
-        m_inner->Raycast(cb, ray);
+        m_inner->Raycast(cb, ray, ignore);
     }
-    void RaycastBatch(rpcQueryCallback* cb, rpcRaycastData* rays, i32 count) const override {
+    void RaycastBatch(rpcQueryCallback* cb, rpcRaycastData* rays, i32 count,
+                      const rpcBody* ignore) const override {
         raycastBatchCount += count;
-        m_inner->RaycastBatch(cb, rays, count);
+        m_inner->RaycastBatch(cb, rays, count, ignore);
     }
 
     mutable int raycastCount = 0;

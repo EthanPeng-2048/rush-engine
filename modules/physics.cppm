@@ -210,6 +210,9 @@ public:
         double proxyMs = 0.0;        // per-shape AABB + index updates
         double syncMs = 0.0;         // whole SyncAndFind (proxy + pairs + clears)
         double pairMs = 0.0;         // pair generation (queries + sort + contacts)
+        double forceMs = 0.0;        // clearing per-body force accumulators
+        double stepMs = 0.0;         // whole backend Step() (closes the accounting)
+        double wrapMs = 0.0;         // adapter work around Step(): force push + events
         int contacts = 0;            // peak live contacts
         int contactPoints = 0;       // peak contact points
         int islands = 0;             // peak island count
@@ -217,6 +220,8 @@ public:
         long steps = 0;              // samples behind the means (0 = no data)
     };
     virtual void ReadStageStats(StageStats& out) const { (void)out; }
+    // Drop accumulated stage means (bench warm-up → measured window).
+    virtual void ResetStageStats() {}
     // Toggle the per-stage timers above (off by default: they cost clock reads).
     virtual void SetDiagnostics(bool on) { (void)on; }
 
@@ -388,6 +393,7 @@ public:
     void SetParallelIslands(bool enabled) override;
     void ReadStageStats(StageStats& out) const override;
     void SetDiagnostics(bool on) override;
+    void ResetStageStats() override;
 
     RayHit Raycast(const Vec3& origin, const Vec3& direction, float maxDistance,
                    BodyHandle ignore = kInvalidBody) const override;
@@ -414,6 +420,11 @@ private:
     double stageNarrowMs_ = 0.0;
     double stageBuildMs_ = 0.0;
     double stageSolveMs_ = 0.0;
+    double stageSyncMs_ = 0.0;
+    double stageForceMs_ = 0.0;
+    double stageStepMs_ = 0.0;
+    double stageWrapMs_ = 0.0;
+    bool diag_ = false;
     long stageSteps_ = 0;
     int stageContactsPeak_ = 0;
     int stagePointsPeak_ = 0;
