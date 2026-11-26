@@ -315,8 +315,11 @@ public:
 
 private:
 	// Step pipeline stages (rpc-refactor.md D6): one concern per method.
-	void SolveIslands( );	// seed loop: BuildIsland per seed, then Initialize/Solve
-	void SolveIslandsBatched( );	// build-all islands, then solve (serial or pooled)
+	void SolveIslands( bool rebuild );	// seed loop: BuildIsland per seed, then Initialize/Solve
+	// `rebuild` = false reuses the island topology from the previous step
+	// (TGS: the contact graph only changes when detection runs), re-initialising
+	// each island from the current transforms.
+	void SolveIslandsBatched( bool rebuild );
 	void SyncAndFind( bool detect );	// proxies + (optional) FindNewContacts + clears
 
 	// DFS the constraint graph from seed into the working island. Stack must
@@ -385,6 +388,10 @@ private:
 	i32 m_bodyUidCounter;  // monotonic body id (contact-budget pair key)
 	i32 m_contactRefresh;  // detect every Nth substep (see rpcSceneConfig)
 	i32 m_substep;         // position within the current detect interval
+	// Island topology cached between detection passes (TGS). Invalidated when
+	// the contact graph can have changed.
+	i32 m_islandCount;
+	bool m_islandsValid;
 	bool m_deepStats;      // opt-in expensive counters (contact points, awake)
 	bool m_statsEnabled;
 	Stats m_stats;

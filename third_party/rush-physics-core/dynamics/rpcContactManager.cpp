@@ -282,9 +282,10 @@ void rpcContactManager::RemoveFromBroadphase( rpcBody *body )
 }
 
 //--------------------------------------------------------------------------------------------------
-void rpcContactManager::PruneSeparatedContacts( void )
+i32 rpcContactManager::PruneSeparatedContacts( void )
 {
 	const r32 slop = -RPC_PENETRATION_SLOP;
+	i32 removed = 0;
 
 	rpcContactConstraint* constraint = m_contactList;
 	while ( constraint )
@@ -321,10 +322,13 @@ void rpcContactManager::PruneSeparatedContacts( void )
 			if ( m_contactListener && ( constraint->m_flags & rpcContactConstraint::eColliding ) )
 				m_contactListener->EndContact( constraint );
 			RemoveContact( constraint );
+			++removed;
 		}
 
 		constraint = next;
 	}
+
+	return removed;
 }
 
 //--------------------------------------------------------------------------------------------------

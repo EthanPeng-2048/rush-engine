@@ -83,7 +83,7 @@ public:
 	// separated between two detection passes keep bridging bodies in the island
 	// graph, and a pile-up collapses into one giant serial island (measured: 35
 	// islands / 8.5 k contacts -> 1 island / 10 k contacts, 4x the step cost).
-	void PruneSeparatedContacts( );
+	i32 PruneSeparatedContacts( );   // returns how many constraints were dropped
 
 	void RenderContacts( rpcRender* debugDrawer ) const;
 
