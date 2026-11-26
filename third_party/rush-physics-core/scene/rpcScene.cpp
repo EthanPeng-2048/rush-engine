@@ -73,6 +73,8 @@ rpcScene::rpcScene( r32 dt, const rpcVec3& gravity, i32 iterations )
 	, m_bodyUidCounter( 0 )
 	, m_contactRefresh( 1 )
 	, m_substep( 0 )
+	, m_islandCount( 0 )
+	, m_islandsValid( false )
 	, m_deepStats( false )
 	, m_statsEnabled( false )
 	, m_stats( )
@@ -103,6 +105,8 @@ rpcScene::rpcScene( const rpcSceneConfig& config )
 	, m_bodyUidCounter( 0 )
 	, m_contactRefresh( 1 )
 	, m_substep( 0 )
+	, m_islandCount( 0 )
+	, m_islandsValid( false )
 	, m_deepStats( false )
 	, m_statsEnabled( false )
 	, m_stats( )
@@ -227,13 +231,14 @@ void rpcScene::Step( )
 		mark = now;
 	}
 
+	i32 pruned = 0;
 	if ( detect )
 		m_contactManager.TestCollisions( );
 	else
 		// Keep the contact graph honest between detection passes: constraints
 		// whose anchors have opened up are dropped, so they stop bridging
 		// bodies into one giant island.
-		m_contactManager.PruneSeparatedContacts( );
+		pruned = m_contactManager.PruneSeparatedContacts( );
 
 	if ( m_statsEnabled )
 	{
@@ -242,7 +247,10 @@ void rpcScene::Step( )
 		mark = now;
 	}
 
-	SolveIslands( );
+	// Reuse the island topology from the previous step unless the contact graph
+	// can have changed: a detection pass, a new shape, or a constraint that was
+	// pruned (its island slice would otherwise point at a freed constraint).
+	SolveIslands( detect || m_newBox || pruned > 0 );
 	SyncAndFind( detect );
 
 	if ( m_statsEnabled )
@@ -254,29 +262,21 @@ void rpcScene::Step( )
 }
 
 //--------------------------------------------------------------------------------------------------
-void rpcScene::SolveIslands( )
+void rpcScene::SolveIslands( bool rebuild )
 {
 	// Batch path: build every island up front, then solve (serial or across
 	// the worker pool — bit-identical numerics, islands share no writable
 	// state). Static track bodies never size the pools, so steady-state
 	// solving allocates and clears nothing.
-	SolveIslandsBatched( );
+	SolveIslandsBatched( rebuild );
 }
 
 //--------------------------------------------------------------------------------------------------
-void rpcScene::SolveIslandsBatched( )
+void rpcScene::SolveIslandsBatched( bool rebuild )
 {
 	StatsClock::time_point mark;
 	if ( m_statsEnabled )
 		mark = StatsClock::now( );
-
-		// island build (shared statics must re-join later islands), so they
-	// never leak across steps — clearing them here would walk 6000+ track
-	// bodies per step for nothing. Iterate the dense dynamic list: walking
-	// m_bodyList would touch every static body's header (296 B apart, scattered
-	// by the heap) just to skip it — measured as ~0.1 ms/substep on a track.
-	for ( rpcBody* body : m_dynamicBodies )
-		body->m_flags &= ~rpcBody::eIsland;
 
 	// Island body lists are built one island at a time into the scratch
 	// buffers, then copied into the step pools at exact offsets. Only the
@@ -294,24 +294,51 @@ void rpcScene::SolveIslandsBatched( )
 	if ( m_slices.size( ) < maxIslands )
 		m_slices.resize( maxIslands );
 
-	// Build every island and Initialize() right away: Initialize snapshots
-	// body->m_islandIndex, which a shared static body would overwrite if the
-	// islands were built first and initialized later. Seeds come from the dense
-	// dynamic list — statics can never seed an island, so iterating them only
-	// costs cache misses walking the linked body list.
-	i32 islandCount = 0;
-	for ( rpcBody* seed : m_dynamicBodies )
+	i32 islandCount = m_islandsValid ? m_islandCount : 0;
+
+	if ( rebuild || !m_islandsValid )
 	{
-		// Seed cannot be apart of an island already
-		if ( seed->m_flags & rpcBody::eIsland )
-			continue;
+		// island build (shared statics must re-join later islands), so they
+		// never leak across steps — clearing them here would walk 6000+ track
+		// bodies per step for nothing. Iterate the dense dynamic list: walking
+		// m_bodyList would touch every static body's header (296 B apart, scattered
+		// by the heap) just to skip it — measured as ~0.1 ms/substep on a track.
+		for ( rpcBody* body : m_dynamicBodies )
+			body->m_flags &= ~rpcBody::eIsland;
 
-		// Seed must be awake
-		if ( !(seed->m_flags & rpcBody::eAwake) )
-			continue;
+		m_contactPeak = rpcMax( m_contactPeak, m_contactManager.m_contactCount );
 
-		BuildAndAppendIsland( seed, islandCount );
-		++islandCount;
+		// Build every island and Initialize() right away: Initialize snapshots
+		// body->m_islandIndex, which a shared static body would overwrite if the
+		// islands were built first and initialized later. Seeds come from the dense
+		// dynamic list — statics can never seed an island, so iterating them only
+		// costs cache misses walking the linked body list.
+		islandCount = 0;
+		for ( rpcBody* seed : m_dynamicBodies )
+		{
+			// Seed cannot be apart of an island already
+			if ( seed->m_flags & rpcBody::eIsland )
+				continue;
+
+			// Seed must be awake
+			if ( !(seed->m_flags & rpcBody::eAwake) )
+				continue;
+
+			BuildAndAppendIsland( seed, islandCount );
+			++islandCount;
+		}
+
+		m_islandCount = islandCount;
+		m_islandsValid = true;
+	}
+	else
+	{
+		// Cached topology: the contact graph is unchanged since the last
+		// detection pass, so only the per-substep state (velocities, anchors,
+		// world inertia) has to be refreshed. Rebuilding the DFS + slices here
+		// was 0.41 ms/substep in a 120-car crush — 3.3 ms per frame at 480 Hz.
+		for ( i32 i = 0; i < islandCount; ++i )
+			m_islands[ (size_t)i ].Initialize( );
 	}
 
 	if ( m_statsEnabled )
