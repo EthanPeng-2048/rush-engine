@@ -388,6 +388,11 @@ void RushPhysicsCore::Step(float dt) {
         stageForceMs_ += st.forceMs;
         stageStepMs_ += st.stepMs;
         stageSyncMs_ += st.syncMs;
+        stagePairQueryMs_ += st.pairQueryMs;
+        stageSortMs_ += st.sortMs;
+        if (st.movedProxies > stageMovedPeak_) stageMovedPeak_ = st.movedProxies;
+        if (st.pairsProduced > stagePairsProducedPeak_) stagePairsProducedPeak_ = st.pairsProduced;
+        if (st.pairsUnique > stagePairsUniquePeak_) stagePairsUniquePeak_ = st.pairsUnique;
         ++stageSteps_;
         if (st.contacts > stageContactsPeak_) stageContactsPeak_ = st.contacts;
         if (st.contactPoints > stagePointsPeak_) stagePointsPeak_ = st.contactPoints;
@@ -637,6 +642,8 @@ void RushPhysicsCore::ResetStageStats() {
     stageBroadMs_ = stageProxyMs_ = stagePairMs_ = stageSyncMs_ = 0.0;
     stageNarrowMs_ = stageBuildMs_ = stageSolveMs_ = stageForceMs_ = 0.0;
     stageStepMs_ = stageWrapMs_ = 0.0;
+    stagePairQueryMs_ = stageSortMs_ = 0.0;
+    stageMovedPeak_ = stagePairsProducedPeak_ = stagePairsUniquePeak_ = 0;
     stageSteps_ = 0;
     stageContactsPeak_ = stagePointsPeak_ = stageIslandsPeak_ = 0;
 }
@@ -666,6 +673,11 @@ void RushPhysicsCore::ReadStageStats(StageStats& out) const {
         out.stepMs = stageStepMs_ / steps;
         out.wrapMs = stageWrapMs_ / steps;
         out.syncMs = stageSyncMs_ / steps;
+        out.pairQueryMs = stagePairQueryMs_ / steps;
+        out.sortMs = stageSortMs_ / steps;
+        out.movedProxies = stageMovedPeak_;
+        out.pairsProduced = stagePairsProducedPeak_;
+        out.pairsUnique = stagePairsUniquePeak_;
         out.narrowphaseMs = stageNarrowMs_ / steps;
         out.islandBuildMs = stageBuildMs_ / steps;
         out.solveMs = stageSolveMs_ / steps;

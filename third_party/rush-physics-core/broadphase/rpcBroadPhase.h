@@ -64,15 +64,30 @@ public:
 
 	bool TestOverlap( i32 A, i32 B ) const;
 
+	// Per-step work counters (O(1), always maintained — they size the broadphase
+	// cost: proxies re-queried, candidate pairs produced, pairs after dedupe).
+	i32 MoveCount( ) const { return m_lastMoveCount; }
+	i32 PairCount( ) const { return m_pairCount; }
+	i32 UniquePairCount( ) const { return m_uniquePairCount; }
+
+	// Sub-stage timing of the last UpdatePairs: sort + dedupe + contact creation,
+	// versus the tree queries that produced the candidates. Off by default.
+	void SetTiming( bool on ) { m_timing = on; }
+	double SortMs( ) const { return m_sortMs; }
+
 private:
 	rpcContactManager *m_manager;
 
 	rpcContactPair* m_pairBuffer;
 	i32 m_pairCount;
 	i32 m_pairCapacity;
+	i32 m_uniquePairCount;   // last UpdatePairs: pairs left after dedupe
+	bool m_timing;
+	double m_sortMs;
 
 	i32* m_moveBuffer;
 	i32 m_moveCount;
+	i32 m_lastMoveCount;   // moves consumed by the last UpdatePairs
 	i32 m_moveCapacity;
 
 	rpcDynamicAABBTree m_tree;

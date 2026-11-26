@@ -96,6 +96,24 @@ bool rpcDynamicAABBTree::Update( i32 id, const rpcAABB& aabb )
 	if ( m_nodes[ id ].aabb.Contains( aabb ) )
 		return false;
 
+	rpcAABB fat = aabb;
+	FattenAABB( fat );
+
+	// Fast path: the parent already holds the re-fattened leaf, so the tree's
+	// shape is still valid and only the ancestors' bounds have to grow. A
+	// remove+reinsert (the original path) re-balances the hierarchy, which is
+	// the right thing when a proxy really travelled — but at 480 Hz a car moves
+	// ~0.17 m per substep, barely past the 0.2 m margin, so nearly every shape
+	// took the expensive path: remove/reinsert with rotations costs an order of
+	// magnitude more than a refit. Measured on 120 cars: see rpc-optimization.md.
+	const i32 parent = m_nodes[ id ].parent;
+	if ( parent != Node::Null && m_nodes[ parent ].aabb.Contains( fat ) )
+	{
+		m_nodes[ id ].aabb = fat;
+		RefitAncestors( parent );
+		return true;
+	}
+
 	RemoveLeaf( id );
 
 	m_nodes[ id ].aabb = aabb;
@@ -104,6 +122,25 @@ bool rpcDynamicAABBTree::Update( i32 id, const rpcAABB& aabb )
 	InsertLeaf( id );
 
 	return true;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Grow the ancestors of a moved leaf, stopping as soon as a node already holds
+// the combined bounds (everything above it is unaffected). Heights do not
+// change: the tree's shape does not change.
+void rpcDynamicAABBTree::RefitAncestors( i32 index )
+{
+	while ( index != Node::Null )
+	{
+		Node& node = m_nodes[ index ];
+		const rpcAABB combined = rpcCombine( m_nodes[ node.left ].aabb, m_nodes[ node.right ].aabb );
+
+		if ( node.aabb.Contains( combined ) )
+			break;
+
+		node.aabb = combined;
+		index = node.parent;
+	}
 }
 
 void *rpcDynamicAABBTree::GetUserData( i32 id ) const

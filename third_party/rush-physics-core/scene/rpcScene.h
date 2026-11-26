@@ -209,10 +209,20 @@ public:
 		double pairMs;       // FindNewContacts (move-buffer queries + sort + contacts)
 		double forceMs;      // clearing per-body force/torque accumulators
 		double stepMs;       // whole Step() — closes the accounting against the sum
+		double pairQueryMs;  // of pairMs: tree queries for moved proxies
+		double sortMs;       // of pairMs: sort + dedupe + contact creation
+		i32 movedProxies;    // shape proxies re-queried last step
+		i32 pairsProduced;   // candidate pairs before dedupe
+		i32 pairsUnique;     // pairs after dedupe
 		size_t poolContactStates;  // island-pool capacity, in states
 		size_t poolBytes;          // total reserved island-pool memory
 	};
-	void SetStatsEnabled( bool on ) { m_statsEnabled = on; }
+	void SetStatsEnabled( bool on )
+	{
+		m_statsEnabled = on;
+		// The broadphase keeps its own sub-stage timer (sort/queue vs queries).
+		m_contactManager.m_broadphase.SetTiming( on );
+	}
 	// Deep counters walk every contact/body per step: tests and offline probes
 	// only, never the benchmark path.
 	void SetDeepStats( bool on ) { m_deepStats = on; }

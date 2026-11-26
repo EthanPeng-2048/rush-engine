@@ -570,7 +570,16 @@ void rpcScene::SyncAndFind( )
 	m_contactManager.FindNewContacts( );
 
 	if ( m_statsEnabled )
-		m_stats.pairMs = ElapsedMs( mark, StatsClock::now( ) );
+	{
+		const StatsClock::time_point now = StatsClock::now( );
+		m_stats.pairMs = ElapsedMs( mark, now );
+		m_stats.sortMs = m_contactManager.m_broadphase.SortMs( );
+		m_stats.pairQueryMs = m_stats.pairMs - m_stats.sortMs;
+		// Same step as the timings above: the move buffer was just consumed.
+		m_stats.movedProxies = m_contactManager.m_broadphase.MoveCount( );
+		m_stats.pairsProduced = m_contactManager.m_broadphase.PairCount( );
+		m_stats.pairsUnique = m_contactManager.m_broadphase.UniquePairCount( );
+	}
 
 	// Clear all forces — dynamic bodies only: static bodies never receive
 	// forces (L2 applies forces to vehicles), and the dense list keeps this

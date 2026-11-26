@@ -29,6 +29,9 @@
 #include "../common/rpcGeometry.h"
 #include "../dynamics/rpcContactManager.h"
 
+#include <algorithm>
+#include <chrono>
+
 //--------------------------------------------------------------------------------------------------
 // rpcBroadPhase
 //--------------------------------------------------------------------------------------------------
@@ -41,8 +44,12 @@ rpcBroadPhase::rpcBroadPhase( rpcContactManager *manager )
 	m_pairBuffer = (rpcContactPair*)rpcAlloc( m_pairCapacity * sizeof( rpcContactPair ) );
 
 	m_moveCount = 0;
+	m_lastMoveCount = 0;
 	m_moveCapacity = 64;
 	m_moveBuffer = (i32*)rpcAlloc( m_moveCapacity * sizeof( i32 ) );
+
+	m_timing = false;
+	m_sortMs = 0.0;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -82,6 +89,9 @@ inline bool ContactPairSort( const rpcContactPair& lhs, const rpcContactPair& rh
 void rpcBroadPhase::UpdatePairs( )
 {
 	m_pairCount = 0;
+	m_uniquePairCount = 0;
+	// Report the buffer that is about to be consumed, not the emptied one.
+	m_lastMoveCount = m_moveCount;
 
 	// Query the tree with all moving boxs
 	for ( i32 i = 0; i < m_moveCount; ++i)
@@ -99,6 +109,8 @@ void rpcBroadPhase::UpdatePairs( )
 	// Reset the move buffer
 	m_moveCount = 0;
 
+	const auto sortStart = m_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
 	// Sort pairs to expose duplicates
 	std::sort( m_pairBuffer, m_pairBuffer + m_pairCount, ContactPairSort );
 
@@ -112,6 +124,7 @@ void rpcBroadPhase::UpdatePairs( )
 			rpcBox *A = (rpcBox*)m_tree.GetUserData( pair->A );
 			rpcBox *B = (rpcBox*)m_tree.GetUserData( pair->B );
 			m_manager->AddContact( A, B );
+			++m_uniquePairCount;
 
 			++i;
 
@@ -132,6 +145,10 @@ void rpcBroadPhase::UpdatePairs( )
 #ifndef NDEBUG
 	m_tree.Validate( );
 #endif
+
+	if ( m_timing )
+		m_sortMs = std::chrono::duration<double, std::milli>(
+		               std::chrono::steady_clock::now( ) - sortStart ).count( );
 }
 
 //--------------------------------------------------------------------------------------------------

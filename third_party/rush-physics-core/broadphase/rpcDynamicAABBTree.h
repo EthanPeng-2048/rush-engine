@@ -122,6 +122,8 @@ private:
 	i32 Balance( i32 index );
 	void InsertLeaf( i32 index );
 	void RemoveLeaf( i32 index );
+	// Grow ancestor bounds after a leaf moved without changing the tree shape.
+	void RefitAncestors( i32 index );
 	void ValidateStructure( i32 index ) const;
 	void RenderNode( rpcRender *render, i32 index ) const;
 
