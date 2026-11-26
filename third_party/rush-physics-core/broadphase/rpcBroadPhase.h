@@ -39,12 +39,10 @@ struct rpcBox;
 struct rpcTransform;
 struct rpcAABB;
 
-struct rpcContactPair
-{
-	i32 A;
-	i32 B;
-};
-
+// One broadphase step: query every proxy that left its fat AABB and hand each
+// overlap straight to the contact manager. There is deliberately no pair buffer
+// and no sort any more — the manager de-duplicates in O(1) (rpcPairMap.h), so
+// the 36 344-element sort + dedupe that dominated a pile-up step is gone.
 class rpcBroadPhase
 {
 public:
@@ -65,25 +63,14 @@ public:
 	bool TestOverlap( i32 A, i32 B ) const;
 
 	// Per-step work counters (O(1), always maintained — they size the broadphase
-	// cost: proxies re-queried, candidate pairs produced, pairs after dedupe).
+	// cost: proxies re-queried and candidate pairs offered).
 	i32 MoveCount( ) const { return m_lastMoveCount; }
 	i32 PairCount( ) const { return m_pairCount; }
-	i32 UniquePairCount( ) const { return m_uniquePairCount; }
-
-	// Sub-stage timing of the last UpdatePairs: sort + dedupe + contact creation,
-	// versus the tree queries that produced the candidates. Off by default.
-	void SetTiming( bool on ) { m_timing = on; }
-	double SortMs( ) const { return m_sortMs; }
 
 private:
 	rpcContactManager *m_manager;
 
-	rpcContactPair* m_pairBuffer;
 	i32 m_pairCount;
-	i32 m_pairCapacity;
-	i32 m_uniquePairCount;   // last UpdatePairs: pairs left after dedupe
-	bool m_timing;
-	double m_sortMs;
 
 	i32* m_moveBuffer;
 	i32 m_moveCount;
@@ -99,30 +86,5 @@ private:
 	friend class rpcDynamicAABBTree;
 	friend class rpcScene;
 };
-
-inline bool rpcBroadPhase::TreeCallBack( i32 index )
-{
-	// Cannot collide with self
-	if ( index == m_currentIndex )
-		return true;
-
-	if ( m_pairCount == m_pairCapacity )
-	{
-		rpcContactPair* oldBuffer = m_pairBuffer;
-		m_pairCapacity *= 2;
-		m_pairBuffer = (rpcContactPair*)rpcAlloc( m_pairCapacity * sizeof( rpcContactPair ) );
-		memcpy( m_pairBuffer, oldBuffer, m_pairCount * sizeof( rpcContactPair ) );
-		rpcFree( oldBuffer );
-	}
-
-	i32 iA = rpcMin( index, m_currentIndex );
-	i32 iB = rpcMax( index, m_currentIndex );
-
-	m_pairBuffer[ m_pairCount ].A = iA;
-	m_pairBuffer[ m_pairCount ].B = iB;
-	++m_pairCount;
-
-	return true;
-}
 
 #endif // RPCBROADPHASE_H

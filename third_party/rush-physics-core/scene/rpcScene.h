@@ -68,6 +68,7 @@ struct rpcSceneConfig
 		, rayStrategy( rpcRayStrategy::Indexed )
 		, dynamicRay( rpcDynamicRay::Tree )
 		, staticGridCell( r32( 2.0 ) )
+		, newContactsPerStep( 0 )
 		, rayFactory( nullptr )
 	{
 	}
@@ -78,6 +79,14 @@ struct rpcSceneConfig
 	rpcRayStrategy rayStrategy;
 	rpcDynamicRay dynamicRay;   // dynamic-side accelerator (Indexed strategy)
 	r32 staticGridCell;   // metres per grid cell along X/Z
+	// Upper bound on constraints CREATED per step (0 = unlimited, the default).
+	// A pile-up can expose tens of thousands of new pairs in one step, but
+	// capping the creation turned out to be the wrong trade: contacts are what
+	// stops interpenetration, so a starved pile deforms and then launches cars
+	// (measured: cars reaching 291 m/s with 67 k pairs stuck in the queue).
+	// The burst is better attacked on the *lookup* side (rpcPairMap.h) than by
+	// refusing to create contacts. Kept as a knob for very small frame budgets.
+	i32 newContactsPerStep;
 	// Optional injection (tests / alternate accelerators). When set, it wins
 	// over `rayStrategy`; the scene takes ownership of what it creates.
 	rpcRayIndexFactory* rayFactory;
@@ -212,17 +221,13 @@ public:
 		double pairQueryMs;  // of pairMs: tree queries for moved proxies
 		double sortMs;       // of pairMs: sort + dedupe + contact creation
 		i32 movedProxies;    // shape proxies re-queried last step
-		i32 pairsProduced;   // candidate pairs before dedupe
-		i32 pairsUnique;     // pairs after dedupe
+		i32 pairsProduced;   // candidate pairs offered last step
+		i32 newContacts;     // constraints created last step (budget-capped)
+		i32 deferredPairs;   // pairs queued for later steps (budget overflow)
 		size_t poolContactStates;  // island-pool capacity, in states
 		size_t poolBytes;          // total reserved island-pool memory
 	};
-	void SetStatsEnabled( bool on )
-	{
-		m_statsEnabled = on;
-		// The broadphase keeps its own sub-stage timer (sort/queue vs queries).
-		m_contactManager.m_broadphase.SetTiming( on );
-	}
+	void SetStatsEnabled( bool on ) { m_statsEnabled = on; }
 	// Deep counters walk every contact/body per step: tests and offline probes
 	// only, never the benchmark path.
 	void SetDeepStats( bool on ) { m_deepStats = on; }
@@ -241,6 +246,8 @@ public:
 	// Monotonic per-scene shape id. Closest-hit selection breaks exact distance
 	// ties by it, so every ray strategy returns the same shape for the same ray.
 	i32 NextBoxUid( ) { return ++m_boxUidCounter; }
+	// Scene-unique dense body id (contact-budget pair key).
+	i32 NextBodyUid( ) { return ++m_bodyUidCounter; }
 	// Shape-proxy hooks (called by rpcBody): route insert/remove/move of a shape
 	// to the ray accelerator that owns it.
 	void RegisterBoxProxy( rpcBox* box, const rpcAABB& fatAabb );
@@ -361,6 +368,7 @@ private:
 	std::vector<rpcContactConstraint*> m_scratchContacts;
 
 	i32 m_boxUidCounter;   // monotonic shape id (closest-hit tie-break)
+	i32 m_bodyUidCounter;  // monotonic body id (contact-budget pair key)
 	bool m_deepStats;      // opt-in expensive counters (contact points, awake)
 	bool m_statsEnabled;
 	Stats m_stats;

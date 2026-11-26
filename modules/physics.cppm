@@ -213,11 +213,27 @@ public:
         double forceMs = 0.0;        // clearing per-body force accumulators
         double stepMs = 0.0;         // whole backend Step() (closes the accounting)
         double wrapMs = 0.0;         // adapter work around Step(): force push + events
-        double pairQueryMs = 0.0;    // of pairMs: broadphase tree queries
-        double sortMs = 0.0;         // of pairMs: sort + dedupe + contact creation
         int movedProxies = 0;        // peak shape proxies re-queried per step
         int pairsProduced = 0;       // peak candidate pairs per step
-        int pairsUnique = 0;         // peak unique pairs per step
+        int newContacts = 0;         // peak constraints created in one step
+        int deferredPairs = 0;       // peak pairs queued by the new-contact budget
+        // Worst single step per stage (means hide the hitch that the player
+        // actually feels: a pile-up is a burst, not a steady state).
+        struct Peak {
+            double stepMs = 0.0;
+            double proxyMs = 0.0;
+            double pairMs = 0.0;
+            double narrowphaseMs = 0.0;
+            double islandBuildMs = 0.0;
+            double solveMs = 0.0;
+            double forceMs = 0.0;
+            double syncMs = 0.0;
+            int contacts = 0;
+            int pairsProduced = 0;
+            int movedProxies = 0;
+            int newContacts = 0;
+            int deferredPairs = 0;
+        } peak;
         int contacts = 0;            // peak live contacts
         int contactPoints = 0;       // peak contact points
         int islands = 0;             // peak island count
@@ -430,10 +446,11 @@ private:
     double stageStepMs_ = 0.0;
     double stageWrapMs_ = 0.0;
     double stagePairQueryMs_ = 0.0;
-    double stageSortMs_ = 0.0;
     int stageMovedPeak_ = 0;
     int stagePairsProducedPeak_ = 0;
-    int stagePairsUniquePeak_ = 0;
+    int stageNewContactsPeak_ = 0;
+    int stageDeferredPeak_ = 0;
+    IPhysicsWorld::StageStats::Peak stagePeak_;
     bool diag_ = false;
     long stageSteps_ = 0;
     int stageContactsPeak_ = 0;

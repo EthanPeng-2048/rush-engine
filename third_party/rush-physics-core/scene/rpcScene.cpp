@@ -70,6 +70,7 @@ rpcScene::rpcScene( r32 dt, const rpcVec3& gravity, i32 iterations )
 	, m_parallelIslands( false )
 	, m_workers( NULL )
 	, m_boxUidCounter( 0 )
+	, m_bodyUidCounter( 0 )
 	, m_deepStats( false )
 	, m_statsEnabled( false )
 	, m_stats( )
@@ -97,6 +98,7 @@ rpcScene::rpcScene( const rpcSceneConfig& config )
 	, m_parallelIslands( false )
 	, m_workers( NULL )
 	, m_boxUidCounter( 0 )
+	, m_bodyUidCounter( 0 )
 	, m_deepStats( false )
 	, m_statsEnabled( false )
 	, m_stats( )
@@ -105,6 +107,7 @@ rpcScene::rpcScene( const rpcSceneConfig& config )
 	, m_dynamicRayIndex( NULL )
 {
 	InitRayIndexes( config );
+	m_contactManager.SetNewContactBudget( config.newContactsPerStep );
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -573,12 +576,11 @@ void rpcScene::SyncAndFind( )
 	{
 		const StatsClock::time_point now = StatsClock::now( );
 		m_stats.pairMs = ElapsedMs( mark, now );
-		m_stats.sortMs = m_contactManager.m_broadphase.SortMs( );
-		m_stats.pairQueryMs = m_stats.pairMs - m_stats.sortMs;
 		// Same step as the timings above: the move buffer was just consumed.
 		m_stats.movedProxies = m_contactManager.m_broadphase.MoveCount( );
 		m_stats.pairsProduced = m_contactManager.m_broadphase.PairCount( );
-		m_stats.pairsUnique = m_contactManager.m_broadphase.UniquePairCount( );
+		m_stats.newContacts = m_contactManager.NewContactsThisStep( );
+		m_stats.deferredPairs = m_contactManager.DeferredPairs( );
 	}
 
 	// Clear all forces — dynamic bodies only: static bodies never receive

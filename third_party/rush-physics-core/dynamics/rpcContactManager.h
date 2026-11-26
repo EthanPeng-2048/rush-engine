@@ -31,6 +31,9 @@
 #include "../broadphase/rpcBroadPhase.h"
 #include "../common/rpcMemory.h"
 #include "../math/rpcVec3.h"
+#include "rpcPairMap.h"
+
+#include <vector>
 
 //--------------------------------------------------------------------------------------------------
 // rpcContactManager
@@ -51,6 +54,14 @@ public:
 	// Add a new contact constraint for a pair of objects
 	// unless the contact constraint already exists
 	void AddContact( rpcBox *A, rpcBox *B );
+
+	// New-constraint budget per step (0 = unlimited). Creating a constraint
+	// allocates and initialises a manifold, so a pile-up that suddenly exposes
+	// thousands of new pairs would otherwise spike a single step; the overflow
+	// is queued and drained by the following steps.
+	void SetNewContactBudget( i32 perStep ) { m_newContactBudget = perStep; }
+	i32 NewContactsThisStep( ) const { return m_newContactsThisStep; }
+	i32 DeferredPairs( ) const { return (i32)m_deferred.size( ); }
 
 	// Has broadphase find all contacts and call AddContact on the
 	// ContactManager for each pair found
@@ -92,8 +103,25 @@ private:
 
 	static void CaptureWarmStart( const rpcManifold& m, WarmStartSnapshot& out );
 
+	// Consume queued pairs (bounded by the per-step budget) before the
+	// broadphase offers this step's candidates.
+	void DrainDeferred( );
+	void CreateConstraint( rpcBox* A, rpcBox* B );
+
 	rpcContactConstraint* m_contactList;
 	i32 m_contactCount;
+	// O(1) persistence lookup: a shape pair maps to its live constraint, and a
+	// body pair maps to how many constraints it already owns (the pile-up cap).
+	rpcPairMap<rpcContactConstraint*> m_pairMap;
+	rpcPairMap<i32> m_bodyPairCounts;
+	struct DeferredPair
+	{
+		rpcBox* A;
+		rpcBox* B;
+	};
+	std::vector<DeferredPair> m_deferred;
+	i32 m_newContactBudget;
+	i32 m_newContactsThisStep;
 	rpcStack* m_stack;
 	rpcPagedAllocator m_allocator;
 	rpcBroadPhase m_broadphase;

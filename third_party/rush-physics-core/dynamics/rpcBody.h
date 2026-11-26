@@ -167,6 +167,10 @@ private:
 	rpcBody* m_next;
 	rpcBody* m_prev;
 	i32 m_islandIndex;
+	// Scene-unique dense id (allocated at creation, never recycled): the body
+	// pair key for the contact-budget map. Pointer pairs cannot be packed into
+	// a 64-bit key without collisions.
+	i32 m_uid;
 	rpcAABB m_fatAabb;
 
 	r32 m_linearDamping;

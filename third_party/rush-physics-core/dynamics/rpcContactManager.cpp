@@ -42,6 +42,8 @@ rpcContactManager::rpcContactManager( rpcStack* stack )
 	m_contactList = NULL;
 	m_contactCount = 0;
 	m_contactListener = NULL;
+	m_newContactBudget = 0;
+	m_newContactsThisStep = 0;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -52,32 +54,82 @@ void rpcContactManager::AddContact( rpcBox *A, rpcBox *B )
 	if ( !bodyA->CanCollide( bodyB ) )
 		return;
 
-	// Search for existing matching contact
-	// Return if found duplicate to avoid duplicate constraints
-	// Mark pre-existing duplicates as active
+	// O(1) "does this shape pair already own a constraint?". The qu3e original
+	// walked bodyA's contact-edge list, i.e. O(contacts of that body) — in a
+	// pile-up one body carries hundreds of edges and the broadphase offers tens
+	// of thousands of candidates per step, so the lookup, not the collision
+	// maths, was the frame's biggest cost (17.9 ms of a 20.3 ms worst-step
+	// broadphase on 120 cars). See rpcPairMap.h.
+	const u64 shapeKey = rpcPairMap<rpcContactConstraint*>::PairKey( A->uid, B->uid );
+	if ( m_pairMap.Find( shapeKey ) )
+		return;
+
+	// Dynamic pairs keep a hard cap per body pair: a pile-up of composite bodies
+	// must not multiply manifolds (11 shapes each => up to 121 per pair).
 	const bool capPair = !( bodyA->m_flags & rpcBody::eStatic ) &&
 	                     !( bodyB->m_flags & rpcBody::eStatic );
-	i32 betweenBodies = 0;
-	rpcContactEdge* edge = A->body->m_contactList;
-	while ( edge )
+	const u64 bodyKey = rpcPairMap<i32>::PairKey( bodyA->m_uid, bodyB->m_uid );
+	if ( capPair )
 	{
-		if ( edge->other == bodyB )
+		const i32* count = m_bodyPairCounts.Find( bodyKey );
+		if ( count && *count >= RPC_MAX_CONTACTS_PER_DYNAMIC_PAIR )
+			return;
+	}
+
+	// Work budget: queue the overflow instead of spiking this step.
+	if ( m_newContactBudget > 0 && m_newContactsThisStep >= m_newContactBudget )
+	{
+		m_deferred.push_back( { A, B } );
+		return;
+	}
+
+	CreateConstraint( A, B );
+
+	++m_newContactsThisStep;
+	if ( capPair )
+	{
+		i32* count = m_bodyPairCounts.Find( bodyKey );
+		if ( count )
+			++*count;
+		else
+			m_bodyPairCounts.Insert( bodyKey, 1 );
+	}
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcContactManager::DrainDeferred( )
+{
+	if ( m_deferred.empty( ) )
+		return;
+
+	// Pairs held over from earlier steps: the shapes may have separated while
+	// queued, and the pair may even have been created by another candidate in
+	// the meantime (AddContact's map check covers that).
+	i32 keep = 0;
+	const i32 limit = m_newContactBudget > 0 ? m_newContactBudget : 0x7fffffff;
+	for ( size_t i = 0; i < m_deferred.size( ); ++i )
+	{
+		const DeferredPair& pair = m_deferred[ i ];
+		if ( m_newContactsThisStep >= limit )
 		{
-			rpcBox *shapeA = edge->constraint->A;
-			rpcBox *shapeB = edge->constraint->B;
-
-			// @TODO: Verify this against Box2D; not sure if this is all we need here
-			if( (A == shapeA) && (B == shapeB) )
-				return;
-
-			// Dynamic pairs have a contact budget: stop at the cap so a pile-up
-			// of composite bodies cannot multiply manifolds per pair.
-			if ( capPair && ++betweenBodies >= RPC_MAX_CONTACTS_PER_DYNAMIC_PAIR )
-				return;
+			m_deferred[ (size_t)keep++ ] = pair;
+			continue;
 		}
 
-		edge = edge->next;
+		if ( !m_broadphase.TestOverlap( pair.A->broadPhaseIndex, pair.B->broadPhaseIndex ) )
+			continue;
+
+		AddContact( pair.A, pair.B );
 	}
+
+	m_deferred.resize( (size_t)keep );
+}
+
+//--------------------------------------------------------------------------------------------------
+void rpcContactManager::CreateConstraint( rpcBox* A, rpcBox* B )
+{
+	rpcBody *bodyA = A->body;
+	rpcBody *bodyB = B->body;
 
 	// Create new contact
 	rpcContactConstraint *contact = (rpcContactConstraint*)m_allocator.Allocate( );
@@ -124,11 +176,20 @@ void rpcContactManager::AddContact( rpcBox *A, rpcBox *B )
 	bodyB->SetToAwake( );
 
 	++m_contactCount;
+
+	// The map stores the constraint so RemoveContact can find it by key; the
+	// pointer is filled in here, after the value slot exists.
+	m_pairMap.Insert( rpcPairMap<rpcContactConstraint*>::PairKey( A->uid, B->uid ), contact );
 }
 
 //--------------------------------------------------------------------------------------------------
 void rpcContactManager::FindNewContacts( )
 {
+	// O(1) lookups mean the per-step dedupe walk is gone; only the raw counters
+	// are reset here. Queued pairs go first so an overflow from a previous step
+	// cannot be starved by a fresh burst.
+	m_newContactsThisStep = 0;
+	DrainDeferred( );
 	m_broadphase.UpdatePairs( );
 }
 
@@ -173,12 +234,31 @@ void rpcContactManager::RemoveContact( rpcContactConstraint *contact )
 
 	--m_contactCount;
 
+	// Drop the persistence-lookup entry and give the body pair its budget back.
+	m_pairMap.Erase( rpcPairMap<rpcContactConstraint*>::PairKey( contact->A->uid, contact->B->uid ) );
+	if ( !( contact->bodyA->m_flags & rpcBody::eStatic ) &&
+	     !( contact->bodyB->m_flags & rpcBody::eStatic ) )
+	{
+		const u64 bodyKey = rpcPairMap<i32>::PairKey( contact->bodyA->m_uid, contact->bodyB->m_uid );
+		if ( i32* count = m_bodyPairCounts.Find( bodyKey ) )
+		{
+			if ( --*count <= 0 )
+				m_bodyPairCounts.Erase( bodyKey );
+		}
+	}
+
 	m_allocator.Free( contact );
 }
 
 //--------------------------------------------------------------------------------------------------
 void rpcContactManager::RemoveContactsFromBody( rpcBody *body )
 {
+	// Queued pairs hold raw shape pointers and the body is going away: drop the
+	// queue rather than let a later drain touch freed shapes. Body destruction
+	// only happens on a race rebuild, so losing the queue costs nothing.
+	if ( !m_deferred.empty( ) )
+		m_deferred.clear( );
+
 	rpcContactEdge* edge = body->m_contactList;
 
 	while( edge )

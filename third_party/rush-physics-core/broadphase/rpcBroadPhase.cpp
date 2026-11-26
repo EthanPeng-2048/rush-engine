@@ -29,9 +29,6 @@
 #include "../common/rpcGeometry.h"
 #include "../dynamics/rpcContactManager.h"
 
-#include <algorithm>
-#include <chrono>
-
 //--------------------------------------------------------------------------------------------------
 // rpcBroadPhase
 //--------------------------------------------------------------------------------------------------
@@ -40,23 +37,17 @@ rpcBroadPhase::rpcBroadPhase( rpcContactManager *manager )
 	m_manager = manager;
 
 	m_pairCount = 0;
-	m_pairCapacity = 64;
-	m_pairBuffer = (rpcContactPair*)rpcAlloc( m_pairCapacity * sizeof( rpcContactPair ) );
 
 	m_moveCount = 0;
 	m_lastMoveCount = 0;
 	m_moveCapacity = 64;
 	m_moveBuffer = (i32*)rpcAlloc( m_moveCapacity * sizeof( i32 ) );
-
-	m_timing = false;
-	m_sortMs = 0.0;
 }
 
 //--------------------------------------------------------------------------------------------------
 rpcBroadPhase::~rpcBroadPhase( )
 {
 	rpcFree( m_moveBuffer );
-	rpcFree( m_pairBuffer );
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -74,81 +65,49 @@ void rpcBroadPhase::RemoveBox( const rpcBox *box )
 }
 
 //--------------------------------------------------------------------------------------------------
-inline bool ContactPairSort( const rpcContactPair& lhs, const rpcContactPair& rhs )
-{
-	if ( lhs.A < rhs.A )
-		return true;
-
-	if ( lhs.A == rhs.A )
-		return lhs.B < rhs.B;
-
-	return false;
-}
-
-//--------------------------------------------------------------------------------------------------
 void rpcBroadPhase::UpdatePairs( )
 {
 	m_pairCount = 0;
-	m_uniquePairCount = 0;
 	// Report the buffer that is about to be consumed, not the emptied one.
 	m_lastMoveCount = m_moveCount;
 
-	// Query the tree with all moving boxs
+	// Query the tree with all moving boxes. Each overlapping proxy is offered to
+	// the manager immediately: the manager keeps a hash of live shape pairs, so
+	// duplicates (two moved proxies finding each other) cost one probe instead
+	// of a sort plus a walk of the body's contact edges.
 	for ( i32 i = 0; i < m_moveCount; ++i)
 	{
 		m_currentIndex = m_moveBuffer[ i ];
 		rpcAABB aabb = m_tree.GetFatAABB( m_currentIndex );
 
-		// @TODO: Use a static and non-static tree and query one against the other.
-		//        This will potentially prevent (gotta think about this more) time
-		//        wasted with queries of static bodies against static bodies, and
-		//        kinematic to kinematic.
 		m_tree.Query( this, aabb );
 	}
 
 	// Reset the move buffer
 	m_moveCount = 0;
 
-	const auto sortStart = m_timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-
-	// Sort pairs to expose duplicates
-	std::sort( m_pairBuffer, m_pairBuffer + m_pairCount, ContactPairSort );
-
-	// Queue manifolds for solving
-	{
-		i32 i = 0;
-		while ( i < m_pairCount )
-		{
-			// Add contact to manager
-			rpcContactPair* pair = m_pairBuffer + i;
-			rpcBox *A = (rpcBox*)m_tree.GetUserData( pair->A );
-			rpcBox *B = (rpcBox*)m_tree.GetUserData( pair->B );
-			m_manager->AddContact( A, B );
-			++m_uniquePairCount;
-
-			++i;
-
-			// Skip duplicate pairs by iterating i until we find a unique pair
-			while ( i < m_pairCount )
-			{
-				rpcContactPair* potentialDup = m_pairBuffer + i;
-
-				if ( pair->A != potentialDup->A || pair->B != potentialDup->B )
-					break;
-
-				++i;
-			}
-		}
-	}
-
 	// Debug-only tree integrity check (walks the free list — keep out of Release)
 #ifndef NDEBUG
 	m_tree.Validate( );
 #endif
+}
 
-	if ( m_timing )
-		m_sortMs = std::chrono::duration<double, std::milli>(
-		               std::chrono::steady_clock::now( ) - sortStart ).count( );
+//--------------------------------------------------------------------------------------------------
+// Tree query callback: one overlapping proxy. The manager de-duplicates in O(1),
+// so the pair is offered immediately instead of being buffered and sorted.
+bool rpcBroadPhase::TreeCallBack( i32 index )
+{
+	// Cannot collide with self
+	if ( index == m_currentIndex )
+		return true;
+
+	++m_pairCount;
+
+	rpcBox* A = (rpcBox*)m_tree.GetUserData( m_currentIndex );
+	rpcBox* B = (rpcBox*)m_tree.GetUserData( index );
+	m_manager->AddContact( A, B );
+
+	return true;
 }
 
 //--------------------------------------------------------------------------------------------------

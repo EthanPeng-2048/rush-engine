@@ -172,11 +172,22 @@ public:
     explicit Impl(float stepDt)
         // rpcScene advances by the fixed dt given here on every Step(). The
         // game calls Step() once per physics substep, so use the same rate.
-        : scene(stepDt, rpcVec3{0.f, -9.81f, 0.f}, 12) {
+        : scene(MakeConfig(stepDt)) {
         // Pre-warm the process-wide worker pool at world creation (race
         // load), so enabling island parallelism later never pays thread
         // creation on the physics hot path.
         (void)rpcWorkerPool::Shared();
+    }
+
+    // Scheduling policy lives in the config (see rpcSceneConfig): the new
+    // contact budget is what turns "a pile-up exposes 12 000 pairs in one step"
+    // from a 20 ms frame into a few bounded steps.
+    static rpcSceneConfig MakeConfig(float stepDt) {
+        rpcSceneConfig config(stepDt);
+        config.gravity = rpcVec3{0.f, -9.81f, 0.f};
+        config.iterations = 12;
+        config.newContactsPerStep = 0;  // unlimited: contacts ARE the anti-penetration work
+        return config;
     }
 
     rpcScene scene;
@@ -388,11 +399,25 @@ void RushPhysicsCore::Step(float dt) {
         stageForceMs_ += st.forceMs;
         stageStepMs_ += st.stepMs;
         stageSyncMs_ += st.syncMs;
-        stagePairQueryMs_ += st.pairQueryMs;
-        stageSortMs_ += st.sortMs;
+        if (st.newContacts > stageNewContactsPeak_) stageNewContactsPeak_ = st.newContacts;
+        if (st.deferredPairs > stageDeferredPeak_) stageDeferredPeak_ = st.deferredPairs;
         if (st.movedProxies > stageMovedPeak_) stageMovedPeak_ = st.movedProxies;
         if (st.pairsProduced > stagePairsProducedPeak_) stagePairsProducedPeak_ = st.pairsProduced;
-        if (st.pairsUnique > stagePairsUniquePeak_) stagePairsUniquePeak_ = st.pairsUnique;
+        if (st.newContacts > stagePeak_.newContacts) stagePeak_.newContacts = st.newContacts;
+        // Worst-case step: the number the player experiences as a hitch.
+        stagePeak_.stepMs = std::max(stagePeak_.stepMs, st.stepMs);
+        stagePeak_.proxyMs = std::max(stagePeak_.proxyMs, st.proxyMs);
+        stagePeak_.pairMs = std::max(stagePeak_.pairMs, st.pairMs);
+        stagePeak_.narrowphaseMs = std::max(stagePeak_.narrowphaseMs, st.narrowphaseMs);
+        stagePeak_.islandBuildMs = std::max(stagePeak_.islandBuildMs, st.islandBuildMs);
+        stagePeak_.solveMs = std::max(stagePeak_.solveMs, st.islandSolveMs);
+        stagePeak_.forceMs = std::max(stagePeak_.forceMs, st.forceMs);
+        stagePeak_.syncMs = std::max(stagePeak_.syncMs, st.syncMs);
+        if (st.deferredPairs > stagePeak_.deferredPairs) stagePeak_.deferredPairs = st.deferredPairs;
+        // (worst-step pair sub-timers were dropped with the sort)
+        if (st.contacts > stagePeak_.contacts) stagePeak_.contacts = st.contacts;
+        if (st.pairsProduced > stagePeak_.pairsProduced) stagePeak_.pairsProduced = st.pairsProduced;
+        if (st.movedProxies > stagePeak_.movedProxies) stagePeak_.movedProxies = st.movedProxies;
         ++stageSteps_;
         if (st.contacts > stageContactsPeak_) stageContactsPeak_ = st.contacts;
         if (st.contactPoints > stagePointsPeak_) stagePointsPeak_ = st.contactPoints;
@@ -642,8 +667,9 @@ void RushPhysicsCore::ResetStageStats() {
     stageBroadMs_ = stageProxyMs_ = stagePairMs_ = stageSyncMs_ = 0.0;
     stageNarrowMs_ = stageBuildMs_ = stageSolveMs_ = stageForceMs_ = 0.0;
     stageStepMs_ = stageWrapMs_ = 0.0;
-    stagePairQueryMs_ = stageSortMs_ = 0.0;
-    stageMovedPeak_ = stagePairsProducedPeak_ = stagePairsUniquePeak_ = 0;
+    stagePairQueryMs_ = 0.0;
+    stageMovedPeak_ = stagePairsProducedPeak_ = stageNewContactsPeak_ = stageDeferredPeak_ = 0;
+    stagePeak_ = IPhysicsWorld::StageStats::Peak{};
     stageSteps_ = 0;
     stageContactsPeak_ = stagePointsPeak_ = stageIslandsPeak_ = 0;
 }
@@ -673,11 +699,12 @@ void RushPhysicsCore::ReadStageStats(StageStats& out) const {
         out.stepMs = stageStepMs_ / steps;
         out.wrapMs = stageWrapMs_ / steps;
         out.syncMs = stageSyncMs_ / steps;
-        out.pairQueryMs = stagePairQueryMs_ / steps;
-        out.sortMs = stageSortMs_ / steps;
+        out.newContacts = stageNewContactsPeak_;
+        out.deferredPairs = stageDeferredPeak_;
         out.movedProxies = stageMovedPeak_;
         out.pairsProduced = stagePairsProducedPeak_;
-        out.pairsUnique = stagePairsUniquePeak_;
+        // (pair sub-timers removed: the dedupe is now O(1), no sort stage)
+        out.peak = stagePeak_;
         out.narrowphaseMs = stageNarrowMs_ / steps;
         out.islandBuildMs = stageBuildMs_ / steps;
         out.solveMs = stageSolveMs_ / steps;

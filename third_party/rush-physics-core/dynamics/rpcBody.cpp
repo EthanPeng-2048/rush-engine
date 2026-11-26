@@ -47,6 +47,7 @@ rpcBody::rpcBody( const rpcBodyDef& def, rpcScene* scene )
 	m_layers = def.layers;
 	m_userData = def.userData;
 	m_scene = scene;
+	m_uid = scene->NextBodyUid( );
 	m_flags = 0;
 	m_linearDamping = def.linearDamping;
 	m_angularDamping = def.angularDamping;
