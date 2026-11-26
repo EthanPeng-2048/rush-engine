@@ -78,6 +78,13 @@ public:
 	// Solves contact manifolds
 	void TestCollisions( void );
 
+	// Every-substep companion to decimated narrowphase (TGS): drop constraints
+	// whose stored local anchors have opened up. Without this, contacts that
+	// separated between two detection passes keep bridging bodies in the island
+	// graph, and a pile-up collapses into one giant serial island (measured: 35
+	// islands / 8.5 k contacts -> 1 island / 10 k contacts, 4x the step cost).
+	void PruneSeparatedContacts( );
+
 	void RenderContacts( rpcRender* debugDrawer ) const;
 
 private:

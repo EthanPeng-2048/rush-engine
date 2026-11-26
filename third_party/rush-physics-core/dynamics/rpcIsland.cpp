@@ -222,21 +222,44 @@ void rpcIsland::Initialize( )
 		c->friction = cc->friction;
 		c->indexA = cc->bodyA->m_islandIndex;
 		c->indexB = cc->bodyB->m_islandIndex;
-		c->normal = cc->manifold.normal;
-		c->tangentVectors[ 0 ] = cc->manifold.tangentVectors[ 0 ];
-		c->tangentVectors[ 1 ] = cc->manifold.tangentVectors[ 1 ];
-		c->contactCount = cc->manifold.contactCount;
 
-		for ( i32 j = 0; j < c->contactCount; ++j )
+		// Re-project the narrowphase result onto the CURRENT transforms. With
+		// decimated narrowphase (TGS) the stored world contact point can be a
+		// frame old, but the local anchors stay attached to the bodies: the
+		// normal follows A's rotation, penetration is the narrowphase depth plus
+		// however far the anchors have drifted apart since, and points that have
+		// opened up are dropped so a separated pair stops being solved.
+		const rpcMat3& rotA = cc->bodyA->m_tx.rotation;
+		const rpcMat3& rotB = cc->bodyB->m_tx.rotation;
+
+		rpcVec3 normal = rpcMul( rotA, cc->manifold.contacts[ 0 ].localNormalA );
+		normal = rpcLengthSq( normal ) > r32( 1.0e-12 ) ? rpcNormalize( normal ) : cc->manifold.normal;
+		c->normal = normal;
+		rpcComputeBasis( normal, c->tangentVectors, c->tangentVectors + 1 );
+
+		i32 kept = 0;
+		for ( i32 j = 0; j < cc->manifold.contactCount; ++j )
 		{
-			rpcContactState *s = c->contacts + j;
-			rpcContact *cp = cc->manifold.contacts + j;
-			s->ra = cp->position - c->centerA;
-			s->rb = cp->position - c->centerB;
-			s->penetration = cp->penetration;
+			const rpcContact* cp = cc->manifold.contacts + j;
+
+			const rpcVec3 ra = rpcMul( rotA, cp->localAnchorA );
+			const rpcVec3 rb = rpcMul( rotB, cp->localAnchorB );
+			const r32 penetration = cp->penetration + rpcDot( ra - rb, normal );
+
+			if ( penetration < -RPC_PENETRATION_SLOP )
+				continue;
+
+			rpcContactState* s = c->contacts + kept;
+			s->ra = ra;
+			s->rb = rb;
+			s->penetration = penetration;
 			s->normalImpulse = cp->normalImpulse;
 			s->tangentImpulse[ 0 ] = cp->tangentImpulse[ 0 ];
 			s->tangentImpulse[ 1 ] = cp->tangentImpulse[ 1 ];
+			s->srcIndex = j;
+			++kept;
 		}
+
+		c->contactCount = kept;
 	}
 }

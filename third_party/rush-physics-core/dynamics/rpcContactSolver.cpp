@@ -54,7 +54,11 @@ void rpcContactSolver::ShutDown( void )
 
 		for ( i32 j = 0; j < c->contactCount; ++j )
 		{
-			rpcContact *oc = cc->manifold.contacts + j;
+			// srcIndex, not j: island setup drops points that separated since the
+			// last detection pass (TGS), so state order no longer matches the
+			// manifold. Writing by j would hand a warm-start impulse to a
+			// different contact point.
+			rpcContact *oc = cc->manifold.contacts + c->contacts[ j ].srcIndex;
 			rpcContactState *cs = c->contacts + j;
 			oc->normalImpulse = cs->normalImpulse;
 			oc->tangentImpulse[ 0 ] = cs->tangentImpulse[ 0 ];

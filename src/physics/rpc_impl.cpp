@@ -187,6 +187,9 @@ public:
         config.gravity = rpcVec3{0.f, -9.81f, 0.f};
         config.iterations = 12;
         config.newContactsPerStep = 0;  // unlimited: contacts ARE the anti-penetration work
+        // TGS: solve every substep (480 Hz stiffness) but detect once per frame
+        // (60 Hz). The game steps 8 substeps per frame at 480 Hz.
+        config.contactRefreshSubsteps = 4;
         return config;
     }
 

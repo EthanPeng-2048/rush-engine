@@ -46,6 +46,10 @@ struct rpcContactState
 	r32 bias;					// Restitution + baumgarte
 	r32 normalMass;				// Normal constraint mass
 	r32 tangentMass[ 2 ];		// Tangent constraint mass
+	// Index of the manifold point this state came from. Island setup drops
+	// points that separated since the last narrowphase (TGS), so state index and
+	// manifold index diverge and the impulse write-back needs the mapping.
+	i32 srcIndex;
 };
 
 struct rpcContactConstraintState
@@ -84,6 +88,6 @@ struct rpcContactSolver
 
 // The solver walks these arrays per iteration; the size is part of the
 // measured per-contact bandwidth budget (see docs/rpc-optimization.md).
-static_assert( sizeof( rpcContactState ) == 56, "rpcContactState size changed: re-check solver bandwidth" );
+static_assert( sizeof( rpcContactState ) == 60, "rpcContactState size changed: re-check solver bandwidth" );
 
 #endif // RPCCONTACTSOLVER_H

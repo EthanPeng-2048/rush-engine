@@ -25,6 +25,7 @@
 //--------------------------------------------------------------------------------------------------
 
 #include "rpcContact.h"
+#include "rpcBody.h"
 
 //--------------------------------------------------------------------------------------------------
 // rpcContact
@@ -43,6 +44,28 @@ void rpcContactConstraint::SolveCollision( void )
 	manifold.contactCount = 0;
 
 	rpcBoxtoBox( &manifold, A, B );
+
+	// Capture the narrowphase result in each body's frame. Everything downstream
+	// (island setup) re-projects from here, so the solver stays correct on the
+	// substeps where narrowphase does not run.
+	if ( manifold.contactCount > 0 )
+	{
+		const rpcTransform txA = bodyA->GetTransform( );
+		const rpcTransform txB = bodyB->GetTransform( );
+		const rpcMat3 invA = rpcTranspose( txA.rotation );
+		const rpcMat3 invB = rpcTranspose( txB.rotation );
+		const rpcVec3 centerA = bodyA->GetWorldCenter( );
+		const rpcVec3 centerB = bodyB->GetWorldCenter( );
+		const rpcVec3 localNormal = rpcMul( invA, manifold.normal );
+
+		for ( i32 i = 0; i < manifold.contactCount; ++i )
+		{
+			rpcContact* c = manifold.contacts + i;
+			c->localAnchorA = rpcMul( invA, c->position - centerA );
+			c->localAnchorB = rpcMul( invB, c->position - centerB );
+			c->localNormalA = localNormal;
+		}
+	}
 
 	if ( manifold.contactCount > 0 )
 	{

@@ -282,6 +282,52 @@ void rpcContactManager::RemoveFromBroadphase( rpcBody *body )
 }
 
 //--------------------------------------------------------------------------------------------------
+void rpcContactManager::PruneSeparatedContacts( void )
+{
+	const r32 slop = -RPC_PENETRATION_SLOP;
+
+	rpcContactConstraint* constraint = m_contactList;
+	while ( constraint )
+	{
+		rpcContactConstraint* next = constraint->next;
+
+		// A constraint created since the last detection pass has no manifold yet:
+		// it is not stale, it is simply untested — keep it.
+		if ( constraint->manifold.contactCount == 0 )
+		{
+			constraint = next;
+			continue;
+		}
+
+		const rpcMat3& rotA = constraint->bodyA->m_tx.rotation;
+		const rpcMat3& rotB = constraint->bodyB->m_tx.rotation;
+
+		bool touching = false;
+		for ( i32 i = 0; i < constraint->manifold.contactCount; ++i )
+		{
+			const rpcContact& cp = constraint->manifold.contacts[ i ];
+			const rpcVec3 normal = rpcMul( rotA, cp.localNormalA );
+			const rpcVec3 drift = rpcMul( rotA, cp.localAnchorA ) - rpcMul( rotB, cp.localAnchorB );
+
+			if ( cp.penetration + rpcDot( drift, normal ) >= slop )
+			{
+				touching = true;
+				break;
+			}
+		}
+
+		if ( !touching )
+		{
+			if ( m_contactListener && ( constraint->m_flags & rpcContactConstraint::eColliding ) )
+				m_contactListener->EndContact( constraint );
+			RemoveContact( constraint );
+		}
+
+		constraint = next;
+	}
+}
+
+//--------------------------------------------------------------------------------------------------
 void rpcContactManager::CaptureWarmStart( const rpcManifold& m, WarmStartSnapshot& out )
 {
 	out.tangent[ 0 ] = m.tangentVectors[ 0 ];

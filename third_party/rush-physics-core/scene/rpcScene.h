@@ -69,6 +69,7 @@ struct rpcSceneConfig
 		, dynamicRay( rpcDynamicRay::Tree )
 		, staticGridCell( r32( 2.0 ) )
 		, newContactsPerStep( 0 )
+		, contactRefreshSubsteps( 1 )
 		, rayFactory( nullptr )
 	{
 	}
@@ -80,13 +81,23 @@ struct rpcSceneConfig
 	rpcDynamicRay dynamicRay;   // dynamic-side accelerator (Indexed strategy)
 	r32 staticGridCell;   // metres per grid cell along X/Z
 	// Upper bound on constraints CREATED per step (0 = unlimited, the default).
-	// A pile-up can expose tens of thousands of new pairs in one step, but
 	// capping the creation turned out to be the wrong trade: contacts are what
 	// stops interpenetration, so a starved pile deforms and then launches cars
 	// (measured: cars reaching 291 m/s with 67 k pairs stuck in the queue).
 	// The burst is better attacked on the *lookup* side (rpcPairMap.h) than by
 	// refusing to create contacts. Kept as a knob for very small frame budgets.
 	i32 newContactsPerStep;
+	// TGS decoupling: the constraint solver runs every substep (that is what
+	// makes a high substep rate worth anything), while collision DETECTION —
+	// pair generation + narrowphase, the two most expensive stages — runs once
+	// every N substeps. 1 = detect every substep (the historical behaviour).
+	//
+	// Correctness rests on the local anchors in rpcContact: narrowphase stores
+	// the contact in each body's frame and the solver re-projects it every
+	// substep, so a detection result stays valid while the bodies move, and
+	// points that open up are dropped. Proxy sync (AABB + ray index) still runs
+	// every substep — the suspension rays read those bounds.
+	i32 contactRefreshSubsteps;
 	// Optional injection (tests / alternate accelerators). When set, it wins
 	// over `rayStrategy`; the scene takes ownership of what it creates.
 	rpcRayIndexFactory* rayFactory;
@@ -161,6 +172,9 @@ public:
 	// Run the simulation forward in time by dt (fixed timestep). Variable
 	// timestep is not supported.
 	void Step( );
+	// Substep rate the solver runs at versus the collision-detection rate.
+	// 1 = detect every substep; N > 1 = TGS-lite (detect every N, solve every).
+	void SetContactRefreshSubsteps( i32 n ) { m_contactRefresh = n > 0 ? n : 1; }
 
 	// Construct a new rigid body. The BodyDef can be reused at the user's
 	// discretion, as no reference to the BodyDef is kept.
@@ -303,7 +317,7 @@ private:
 	// Step pipeline stages (rpc-refactor.md D6): one concern per method.
 	void SolveIslands( );	// seed loop: BuildIsland per seed, then Initialize/Solve
 	void SolveIslandsBatched( );	// build-all islands, then solve (serial or pooled)
-	void SyncAndFind( );	// SynchronizeProxies + FindNewContacts + clear forces
+	void SyncAndFind( bool detect );	// proxies + (optional) FindNewContacts + clears
 
 	// DFS the constraint graph from seed into the working island. Stack must
 	// hold at least m_bodyCount entries.
@@ -369,6 +383,8 @@ private:
 
 	i32 m_boxUidCounter;   // monotonic shape id (closest-hit tie-break)
 	i32 m_bodyUidCounter;  // monotonic body id (contact-budget pair key)
+	i32 m_contactRefresh;  // detect every Nth substep (see rpcSceneConfig)
+	i32 m_substep;         // position within the current detect interval
 	bool m_deepStats;      // opt-in expensive counters (contact points, awake)
 	bool m_statsEnabled;
 	Stats m_stats;

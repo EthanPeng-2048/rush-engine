@@ -71,6 +71,8 @@ rpcScene::rpcScene( r32 dt, const rpcVec3& gravity, i32 iterations )
 	, m_workers( NULL )
 	, m_boxUidCounter( 0 )
 	, m_bodyUidCounter( 0 )
+	, m_contactRefresh( 1 )
+	, m_substep( 0 )
 	, m_deepStats( false )
 	, m_statsEnabled( false )
 	, m_stats( )
@@ -99,6 +101,8 @@ rpcScene::rpcScene( const rpcSceneConfig& config )
 	, m_workers( NULL )
 	, m_boxUidCounter( 0 )
 	, m_bodyUidCounter( 0 )
+	, m_contactRefresh( 1 )
+	, m_substep( 0 )
 	, m_deepStats( false )
 	, m_statsEnabled( false )
 	, m_stats( )
@@ -108,6 +112,7 @@ rpcScene::rpcScene( const rpcSceneConfig& config )
 {
 	InitRayIndexes( config );
 	m_contactManager.SetNewContactBudget( config.newContactsPerStep );
+	SetContactRefreshSubsteps( config.contactRefreshSubsteps );
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -201,7 +206,15 @@ void rpcScene::Step( )
 		mark = StatsClock::now( );
 	const StatsClock::time_point stepStart = mark;
 
-	if ( m_newBox )
+	// TGS: collision detection (pair generation + narrowphase) runs once per
+	// detect interval; the solver below runs every substep. Contacts found at
+	// the last detection stay valid in between because they are stored as
+	// per-body local anchors (see rpcContact).
+	const bool detect = ( m_substep == 0 );
+	if ( ++m_substep >= m_contactRefresh )
+		m_substep = 0;
+
+	if ( m_newBox && detect )
 	{
 		m_contactManager.m_broadphase.UpdatePairs( );
 		m_newBox = false;
@@ -214,7 +227,13 @@ void rpcScene::Step( )
 		mark = now;
 	}
 
-	m_contactManager.TestCollisions( );
+	if ( detect )
+		m_contactManager.TestCollisions( );
+	else
+		// Keep the contact graph honest between detection passes: constraints
+		// whose anchors have opened up are dropped, so they stop bridging
+		// bodies into one giant island.
+		m_contactManager.PruneSeparatedContacts( );
 
 	if ( m_statsEnabled )
 	{
@@ -224,7 +243,7 @@ void rpcScene::Step( )
 	}
 
 	SolveIslands( );
-	SyncAndFind( );
+	SyncAndFind( detect );
 
 	if ( m_statsEnabled )
 	{
@@ -550,7 +569,7 @@ void rpcScene::BuildIsland( rpcBody* seed, rpcIsland& island, rpcBody** stack, i
 }
 
 //--------------------------------------------------------------------------------------------------
-void rpcScene::SyncAndFind( )
+void rpcScene::SyncAndFind( bool detect )
 {
 	StatsClock::time_point mark;
 	if ( m_statsEnabled )
@@ -569,7 +588,10 @@ void rpcScene::SyncAndFind( )
 		mark = now;
 	}
 
-	// Look for new contacts
+	// Pair generation runs EVERY substep even under TGS: skipping it only lets the
+	// move buffer accumulate, which makes the next detection step that much
+	// heavier (measured: 4x the moved proxies and 4x the peak). It is the cheap
+	// half of collision detection; the narrowphase below is the expensive half.
 	m_contactManager.FindNewContacts( );
 
 	if ( m_statsEnabled )

@@ -83,11 +83,18 @@ struct rpcContact
 	r32 penetration;			// Depth of penetration from collision
 	r32 normalImpulse;			// Accumulated normal impulse
 	r32 tangentImpulse[ 2 ];	// Accumulated friction impulse
-	r32 bias;					// Restitution + baumgarte
-	r32 normalMass;				// Normal constraint mass
-	r32 tangentMass[ 2 ];		// Tangent constraint mass
 	rpcFeaturePair fp;			// Features on A and B for this contact
 	u8 warmStarted;				// Used for debug rendering
+
+	// Narrowphase runs once per frame while the solver runs every substep (TGS,
+	// see rpcSceneConfig::contactRefreshSubsteps), so a world-space contact
+	// point would be stale by up to a frame of motion. These anchors are the
+	// narrowphase result expressed in each body's frame: the solver re-projects
+	// them every substep (rpcIsland::Initialize) and derives penetration from
+	// how far they have moved apart since.
+	rpcVec3 localAnchorA;		// Contact point in A's frame (relative to its COM)
+	rpcVec3 localAnchorB;		// Contact point in B's frame
+	rpcVec3 localNormalA;		// Manifold normal (A -> B) in A's frame
 };
 
 struct rpcManifold
