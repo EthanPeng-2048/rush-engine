@@ -396,9 +396,14 @@ void Suspension::Step(const CarFrame& frame, BodyHandle chassis, float wheelRadi
         // four corners at once and free-fall the car through the road.
         const bool buried = hit.inside;
         if (buried || (hit.hit && Dot(hit.normal, up) > 0.25f)) {
-            const float suspLength =
-                buried ? params_.suspensionRestLength - params_.CompressionLimit()
-                       : hit.fraction * rayLen - wheelRadius;
+            // Buried: the strut is at least fully compressed, but how much past
+            // that is unknown (there is no entry point). Charge it the travel
+            // limit, not the end of the bump stop — the limit force (k*travel
+            // per corner) already out-lifts any load the car can produce, and
+            // the bump-stop peak would launch a bottomed-out car into the air
+            // (4 x 29 kN on 750 kg) instead of easing it off the road.
+            const float suspLength = buried ? params_.suspensionRestLength - params_.suspensionMaxTravel
+                                            : hit.fraction * rayLen - wheelRadius;
             const float compression = Clampf(params_.suspensionRestLength - suspLength, -0.02f,
                                              params_.CompressionLimit());
             const float compressionRate =
