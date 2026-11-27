@@ -884,6 +884,69 @@ void Vehicle::Reset(const Transform& pose) {
 
 float Vehicle::SteerEnvelopeDeg(float speed) const { return apex::SteerEnvelopeDeg(params_, speed); }
 
+VehicleSnapshotState Vehicle::SaveState() const {
+    VehicleSnapshotState s;
+    s.state = state_;
+    s.transform = state_.transform;
+    s.linearVelocity = state_.velocity;
+    s.angularVelocity = state_.angularVelocity;
+    // The authoritative pose lives in the backend, not in state_.
+    if (world_ && chassis_ != kInvalidBody) {
+        if (const auto t = world_->GetTransform(chassis_)) s.transform = *t;
+        if (const auto v = world_->GetLinearVelocity(chassis_)) s.linearVelocity = *v;
+        if (const auto w = world_->GetAngularVelocity(chassis_)) s.angularVelocity = *w;
+    }
+    for (int i = 0; i < 4; ++i) {
+        s.wheelOmega[i] = tires_[i].Omega();
+        s.wheelAlpha[i] = tires_[i].Alpha();
+    }
+    s.engine = engine_;
+    s.gearbox = gearbox_;
+    s.diff = diff_;
+    s.susp = susp_;
+    s.aero = aero_;
+    s.assists = assists_;
+    s.controls = controls_;
+    s.wingTogglePrev = wingTogglePrev_;
+    s.brakePerWheel = brakePerWheel_;
+    s.rearAxleDrive = rearAxleDrive_;
+    s.drivelineLoad = drivelineLoad_;
+    s.gearPrev = gearPrev_;
+    s.wheelSpinAngle = wheelSpinAngle_;
+    return s;
+}
+
+void Vehicle::RestoreState(const VehicleSnapshotState& snapshot) {
+    state_ = snapshot.state;
+    state_.transform = snapshot.transform;
+    state_.velocity = snapshot.linearVelocity;
+    state_.angularVelocity = snapshot.angularVelocity;
+    for (int i = 0; i < 4; ++i) {
+        tires_[i].SetIntegrator(snapshot.wheelOmega[i], snapshot.wheelAlpha[i]);
+        // Wear is authored by the snapshot's readout (that is the field the
+        // network carries); keep the tire model in step with it.
+        tires_[i].SetWear(state_.wheels[i].wear);
+    }
+    engine_ = snapshot.engine;
+    gearbox_ = snapshot.gearbox;
+    diff_ = snapshot.diff;
+    susp_ = snapshot.susp;
+    aero_ = snapshot.aero;
+    assists_ = snapshot.assists;
+    controls_ = snapshot.controls;
+    wingTogglePrev_ = snapshot.wingTogglePrev;
+    brakePerWheel_ = snapshot.brakePerWheel;
+    rearAxleDrive_ = snapshot.rearAxleDrive;
+    drivelineLoad_ = snapshot.drivelineLoad;
+    gearPrev_ = snapshot.gearPrev;
+    wheelSpinAngle_ = snapshot.wheelSpinAngle;
+    if (world_ && chassis_ != kInvalidBody) {
+        (void)world_->SetTransform(chassis_, snapshot.transform);
+        (void)world_->SetLinearVelocity(chassis_, snapshot.linearVelocity);
+        (void)world_->SetAngularVelocity(chassis_, snapshot.angularVelocity);
+    }
+}
+
 void Vehicle::Update(const CarInput& input, float dt) {
     if (!world_ || chassis_ == kInvalidBody) return;
 

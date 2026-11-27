@@ -567,6 +567,13 @@ public:
     void SetWear(float wear) { wear_ = Clampf(wear, 0.f, 1.f); }
     float GripMultiplier() const;
     float Omega() const { return omega_; }
+    // Integrator state access for rollback (Vehicle::SaveState/RestoreState):
+    // omega is the wheel spin [rad/s], alpha the relaxed lateral slip [rad].
+    float Alpha() const { return alpha_; }
+    void SetIntegrator(float omega, float alphaRad) {
+        omega_ = omega;
+        alpha_ = alphaRad;
+    }
     void Reset();
 
 private:
@@ -1165,6 +1172,45 @@ private:
 };
 
 // ============================================================================
+// Full simulation state of one car: everything Update() carries across
+// substeps, plus the body pose that lives in the collision backend.
+//
+// SaveState()/RestoreState() round-trip bit-exactly on the same machine, which
+// is what client-side rollback (LAN prediction) needs: restore an authoritative
+// tick, replay the unconfirmed inputs, keep going.
+//
+// A caller that only knows part of the state (e.g. the compact fields carried
+// over the network) can SaveState(), overwrite the fields it knows, then
+// RestoreState(): integrator state is taken from `state.wheels`/wheelOmega, so
+// the car stays self-consistent.
+struct VehicleSnapshotState {
+    VehicleState state;                 // public readout (wheels[], gear, ers…)
+    Transform transform;                // chassis pose (authoritative copy)
+    Vec3 linearVelocity;
+    Vec3 angularVelocity;
+
+    // Tire integrators per wheel (kept explicit: `state.wheels` carries the
+    // readout, these are the values Update() integrates forward).
+    std::array<float, 4> wheelOmega{};
+    std::array<float, 4> wheelAlpha{};
+
+    Engine engine;
+    Transmission gearbox;
+    Differential diff;
+    Suspension susp;
+    AeroKit aero;
+    DriverAssistance assists;
+    DriverControls controls;
+
+    bool wingTogglePrev = false;
+    std::array<float, 4> brakePerWheel{};
+    float rearAxleDrive = 0.f;
+    float drivelineLoad = 0.f;
+    int gearPrev = 1;
+    float wheelSpinAngle = 0.f;
+};
+
+// ============================================================================
 // Chassis rigid body + 4 raycast-suspension wheels + combined-slip tires.
 // Orchestrates the components; all physics goes through IPhysicsWorld so the
 // collision backend is replaceable (qu3e today, Jolt later).
@@ -1183,6 +1229,11 @@ public:
     void ProcessContacts(const std::vector<ContactEvent>& contacts, float dt);
 
     void Reset(const Transform& pose);
+
+    // Rollback support: complete simulation state in / out. RestoreState also
+    // writes the body pose and velocities back through the physics world.
+    VehicleSnapshotState SaveState() const;
+    void RestoreState(const VehicleSnapshotState& snapshot);
 
     const VehicleState& State() const { return state_; }
     const VehicleParams& Params() const { return params_; }
