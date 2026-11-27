@@ -220,7 +220,8 @@ Engine::StepOutput Engine::Step(const StepInput& in) {
         st_.rpm = 200.f;
     }
 
-    // 6. Crank integration against the driveline load; ERS adds crank torque.
+    // 6. Crank integration against the driveline load; the energy store adds
+    //    its deploy power as crank torque.
     const float ersCrank = in.ersPower > 0.f ? in.ersPower / std::max(6.f, st_.omega) : 0.f;
     const float net = gas - friction - in.loadTorque + ersCrank;
     st_.omega += net / std::max(0.1f, in.inertia) * dt;
@@ -240,24 +241,8 @@ void Engine::Rescale(float factor) {
     st_.rpm = st_.omega * 60.f / (2.f * kPi);
 }
 
-float Engine::UpdateErc(const CarInput& intent, float throttle, float brake, float speed,
-                        bool overtakeEnabled, float dt) {
-    st_.ersDeploying = false;
-    float deployPower = 0.f;
-    if (overtakeEnabled && intent.overtake && st_.ersCharge > 0.02f && throttle > 0.5f) {
-        deployPower = params_.ersDeployPower * params_.overtakeMultiplier;
-        st_.ersDeploying = true;
-        st_.ersCharge = std::max(0.f, st_.ersCharge - deployPower * dt / params_.ersCapacity);
-    } else if (brake > 0.15f && speed > 8.f) {
-        const float regen = params_.ersRegenPower * std::min(1.f, brake * 1.4f);
-        st_.ersCharge = std::min(1.f, st_.ersCharge + regen * dt / params_.ersCapacity);
-    }
-    return deployPower;
-}
-
 void Engine::Reset() {
     st_ = State{};
-    st_.ersCharge = params_.ersBaseCharge;
     rng_ = params_.misfireSeed;
 }
 
@@ -837,6 +822,7 @@ void Vehicle::Spawn(IPhysicsWorld& world, const Transform& pose, const VehiclePa
 
     // Component assembly.
     engine_.Init(params.engine);
+    ers_.Init(params.ers, params.capabilities);
     gearbox_.Init(params.gearbox);
     diff_.Init(params.differential);
     susp_.Init(params.suspension);
@@ -845,7 +831,7 @@ void Vehicle::Spawn(IPhysicsWorld& world, const Transform& pose, const VehiclePa
     controls_.Init(params.controls);
 
     for (int i = 0; i < 4; ++i) state_.wheels[i] = WheelState{};
-    state_.ersCharge = engine_.StateRef().ersCharge;
+    state_.ersCharge = ers_.StateRef().charge;
     state_.wingMode = WingMode::ZMode;
     state_.transform = pose;
 }
@@ -870,6 +856,7 @@ void Vehicle::Reset(const Transform& pose) {
         tires_[i].Reset();
     }
     engine_.Reset();
+    ers_.Reset();
     gearbox_.Reset();
     diff_.Reset();
     susp_.Reset();
@@ -878,7 +865,7 @@ void Vehicle::Reset(const Transform& pose) {
     controls_.Reset();
     gearPrev_ = gearbox_.StateRef().gear;
     drivelineLoad_ = 0.f;
-    state_.ersCharge = engine_.StateRef().ersCharge;
+    state_.ersCharge = ers_.StateRef().charge;
     state_.wingMode = WingMode::ZMode;
 }
 
@@ -901,6 +888,7 @@ VehicleSnapshotState Vehicle::SaveState() const {
         s.wheelAlpha[i] = tires_[i].Alpha();
     }
     s.engine = engine_;
+    s.ers = ers_;
     s.gearbox = gearbox_;
     s.diff = diff_;
     s.susp = susp_;
@@ -928,6 +916,7 @@ void Vehicle::RestoreState(const VehicleSnapshotState& snapshot) {
         tires_[i].SetWear(state_.wheels[i].wear);
     }
     engine_ = snapshot.engine;
+    ers_ = snapshot.ers;
     gearbox_ = snapshot.gearbox;
     diff_ = snapshot.diff;
     susp_ = snapshot.susp;
@@ -997,9 +986,17 @@ void Vehicle::Update(const CarInput& input, float dt) {
     // speed would flip the rear to drive). The clutch opens only at
     // standstill idle so the engine can hold rpm without shoving the car
     // (auto-clutch behaviour). TCS/ESC enter as throttle cut / brake reserve.
-    const float ersPower =
-        engine_.UpdateErc(input, ctrl.throttle, ctrl.brake, frame.speed,
-                          HasCapability(params_.capabilities, VehicleCapability::Overtake), dt);
+    // The energy store steps first: its charge is part of the car state, so it
+    // decides regen / deploy from the smoothed driver inputs and the engine
+    // then only sees a power contribution at the crank.
+    ErsUnit::StepInput ers;
+    ers.throttle = ctrl.throttle;
+    ers.brake = ctrl.brake;
+    ers.speed = frame.speed;
+    ers.overtake = input.overtake;
+    ers.dt = dt;
+    ers_.Step(ers);
+    const float ersPower = ers_.StateRef().power;
     const int gearPre = gearbox_.StateRef().gear;
     const float ratioPre = params_.gearbox.gearRatios[static_cast<size_t>(std::max(0, gearPre - 1))];
     const float totalRatioPre = ratioPre * params_.gearbox.finalDrive;
@@ -1214,8 +1211,8 @@ void Vehicle::Update(const CarInput& input, float dt) {
     state_.throttle = ctrl.throttle;
     state_.brake = ctrl.brake;
     state_.steerAngleDeg = aid.steer * kRadToDeg;
-    state_.ersCharge = engine_.StateRef().ersCharge;
-    state_.ersDeploying = engine_.StateRef().ersDeploying;
+    state_.ersCharge = ers_.StateRef().charge;
+    state_.ersDeploying = ers_.StateRef().deploying;
     state_.frontDownforce = aero_.StateRef().frontDownforce;
     state_.rearDownforce = aero_.StateRef().rearDownforce;
     state_.dragForce = aero_.StateRef().dragForce;

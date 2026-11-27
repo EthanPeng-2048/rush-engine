@@ -655,8 +655,10 @@ enum class AssistLevel : int {
 // touching the others.
 
 // Engine: torque curve, crankshaft dynamics (I_c * dw = T_gas - T_fric -
-// T_load), simplified combustion (firing pulses / rev limiter / misfire) and
-// the 2026 hybrid ERS store. rpm is a force-balance result, not a table.
+// T_load) and simplified combustion (firing pulses / rev limiter / misfire).
+// rpm is a force-balance result, not a table. The engine does NOT own the
+// hybrid store: it takes deploy power as StepInput.ersPower and knows nothing
+// about where it came from (see ErsUnit).
 struct EngineParams {
     float maxTorque = 420.f;          // Nm at the crank (gas torque, WOT, peak)
     float idleRpm = 3800.f;
@@ -681,13 +683,18 @@ struct EngineParams {
     float frictionC1 = 0.004f;        // Nm per rad/s
     float pumpingTorque = 25.f;       // Nm at fully closed throttle
     float idleHoldTorque = 320.f;     // idle governor cap [Nm]
+};
 
-    // ERS / overtake (2026 hybrid store)
-    float ersCapacity = 4.0e6f;       // J
-    float ersDeployPower = 350000.f;  // W
-    float ersRegenPower = 250000.f;   // W under braking
-    float ersBaseCharge = 0.55f;
-    float overtakeMultiplier = 1.28f;
+// ERS (hybrid energy store): a self-contained part — the 2026 turbo-hybrid
+// store, its regen under braking and its deploy onto the crank. Split out of
+// Engine so a car can run without one (VehicleCapability::Ers) and so the
+// store can be tuned/replaced like any other part.
+struct ErsParams {
+    float capacity = 4.0e6f;         // J
+    float deployPower = 350000.f;    // W
+    float regenPower = 250000.f;     // W under braking
+    float baseCharge = 0.55f;        // charge at spawn / after a reset
+    float overtakeMultiplier = 1.28f;  // deploy profile while overriding
 };
 
 // Transmission: gear ratios / final drive / shift logic + drive & brake split.
@@ -880,6 +887,7 @@ struct VehicleParams {
 
     // Components — replace / tune each independently (改车).
     EngineParams engine;
+    ErsParams ers;
     TransmissionParams gearbox;
     DifferentialParams differential;
     SuspensionParams suspension;
@@ -985,8 +993,6 @@ public:
         float firingPhase = 0.f;      // [0,1) within one firing interval (audio phase source)
         float intakeFill = 0.f;       // throttle lag state [0..1]
         bool fuelCut = false;
-        float ersCharge = 0.55f;
-        bool ersDeploying = false;
     };
 
     struct StepInput {
@@ -1008,16 +1014,12 @@ public:
     void Init(const EngineParams& p) {
         params_ = p;
         st_ = State{};
-        st_.ersCharge = p.ersBaseCharge;
         rng_ = p.misfireSeed;
     }
     // One crank step: intake lag -> fuel cut -> firing pulses/misfire -> idle
-    // governor -> integrate omega against the load.
+    // governor -> integrate omega against the load. ersPower is the deploy
+    // power handed in by the vehicle's energy store [W] (0 = none).
     StepOutput Step(const StepInput& in);
-    // ERS: deploy on overtake / regen under braking. Returns deploy power [W]
-    // (or 0) after updating charge. throttle/brake are the smoothed values.
-    float UpdateErc(const CarInput& intent, float throttle, float brake, float speed,
-                    bool overtakeEnabled, float dt);
     // Rigid-driveline ratio change (gear shift): omega *= factor.
     void Rescale(float factor);
     const State& StateRef() const { return st_; }
@@ -1029,6 +1031,50 @@ private:
     EngineParams params_;
     State st_;
     uint32_t rng_ = 0u;               // xorshift misfire rolls (seeded, deterministic)
+};
+
+// --- ERS (hybrid energy store) ---------------------------------------------
+// Owns the store's charge and the regen / deploy law. The vehicle steps it
+// BEFORE the crank and hands the resulting power to Engine::StepInput.ersPower,
+// so the engine only sees an electrical torque contribution.
+//
+// Capability gate: a car without VehicleCapability::Ers has no store at all —
+// charge stays 0, nothing regenerates, nothing deploys, power stays 0. Deploy
+// additionally needs VehicleCapability::Overtake plus the driver's override,
+// charge above the reserve and real throttle.
+class ErsUnit {
+public:
+    struct State {
+        float charge = 0.f;        // [0..1] of capacity
+        bool deploying = false;
+        float power = 0.f;         // deployed power [W] for the crank this substep
+    };
+
+    // Driver-facing inputs, already smoothed by DriverControls.
+    struct StepInput {
+        float throttle = 0.f;      // [0..1]
+        float brake = 0.f;         // [0..1]
+        float speed = 0.f;         // |v| [m/s]
+        bool overtake = false;     // driver pressed the override
+        float dt = 0.f;
+    };
+
+    // capabilities: the car's VehicleCapability mask. Fitting (and the
+    // override profile) are read from it once, so the part is either on the car
+    // or it is not — never half-present.
+    void Init(const ErsParams& p, std::uint8_t capabilities);
+    // One substep: deploy on override, else regen under braking.
+    void Step(const StepInput& in);
+    void Reset();
+
+    bool Fitted() const { return fitted_; }
+    const State& StateRef() const { return st_; }
+
+private:
+    ErsParams params_;
+    State st_;
+    bool fitted_ = false;          // VehicleCapability::Ers
+    bool overtakeFitted_ = false;  // VehicleCapability::Overtake
 };
 
 // --- Transmission ----------------------------------------------------------
@@ -1235,6 +1281,7 @@ struct VehicleSnapshotState {
     std::array<float, 4> wheelAlpha{};
 
     Engine engine;
+    ErsUnit ers;
     Transmission gearbox;
     Differential diff;
     Suspension susp;
@@ -1304,6 +1351,7 @@ private:
 
     // Component assembly
     Engine engine_;
+    ErsUnit ers_;
     Transmission gearbox_;
     Differential diff_;
     Suspension susp_;

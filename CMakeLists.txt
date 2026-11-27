@@ -48,6 +48,7 @@ add_library(rush-engine STATIC
     src/physics/nudge_impl.cpp
     src/physics/rpc_impl.cpp
     src/physics/vehicle_impl.cpp
+    src/physics/ers_impl.cpp
     src/physics/collision_bus.cpp
     src/physics/raycast_probe.cpp  # TEMP probe — remove with the perf work
     src/render/null_impl.cpp
