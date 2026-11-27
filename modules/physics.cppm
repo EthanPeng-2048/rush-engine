@@ -739,6 +739,40 @@ struct SuspensionParams {
     float suspensionRestLength = 0.16f;
     float suspensionMaxTravel = 0.22f;
 
+    // Rising-rate bump stop over the last part of the travel. The corner load
+    // must keep growing at the travel limit: with a hard clamp at
+    // suspensionMaxTravel the spring force saturated (k * travel per corner),
+    // so under full downforce plus roll/pitch transfer the four corners could
+    // carry less than the load, the body sank until the chassis was inside the
+    // road, and the suspension rays — one per corner, starting inside the
+    // collider — lost the ground entirely (free fall through the slab).
+    float bumpStopStiffnessRatio = 10.f;  // x springK beyond suspensionMaxTravel
+    float bumpStopTravel = 0.05f;         // m of extra compression it absorbs
+
+    // Deepest compression the strut reaches: main travel + bump stop. The
+    // spring is clamped here (the strut is mechanically bottomed out).
+    float CompressionLimit() const { return suspensionMaxTravel + bumpStopTravel; }
+
+    // Ray length that still sees the ground with the corner on the bump stop.
+    // Deriving it from CompressionLimit() keeps "how far the strut can travel"
+    // and "how far the ray looks" from drifting apart — a ray sized for
+    // suspensionMaxTravel alone loses the ground while the body is still above
+    // the road, which reads as airborne.
+    float RayLength(float wheelRadius) const {
+        return suspensionRestLength + CompressionLimit() + wheelRadius;
+    }
+
+    // Spring force [N] for a compression [m]: main spring inside the travel
+    // range, then the stiffer bump-stop spring on top of it. Continuous at
+    // suspensionMaxTravel (the bump stop contributes 0 there), so the ride on
+    // the main spring is unchanged.
+    float SpringForce(float compression, float springK) const {
+        float force = springK * (compression > 0.f ? compression : 0.f);
+        const float beyond = compression - suspensionMaxTravel;
+        if (beyond > 0.f) force += springK * bumpStopStiffnessRatio * beyond;
+        return force;
+    }
+
     // Anti-roll bars: equal-and-opposite load correction from the axle's
     // compression difference (0 = no bar). Front/rear ratio tunes the roll
     // stiffness split = cornering balance.

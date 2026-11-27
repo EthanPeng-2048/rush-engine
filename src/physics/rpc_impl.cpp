@@ -260,7 +260,22 @@ public:
     const std::unordered_map<const rpcBox*, BodyHandle>* boxToBody = nullptr;
     RayHit result;
     i32 resultUid = 0x7fffffff;  // tie-break id of the current best hit
+    // Candidate "the origin started inside this collider" report. Only a
+    // candidate: a real hit further along the ray wins, because a hardpoint
+    // buried in a barrier still has the road underneath it.
+    RayHit insideCandidate;
+    bool sawInside = false;
     uint64_t leafTests = 0;  // TEMP probe
+
+    // Final answer: the closest real hit, else the buried report, else a miss.
+    RayHit Finish() const {
+        if (result.hit) return result;
+        if (!sawInside) return result;
+        RayHit out = insideCandidate;
+        out.hit = false;
+        out.inside = true;
+        return out;
+    }
 
     bool ReportShape(rpcBox* box) override {
         ++leafTests;  // TEMP probe
@@ -271,8 +286,20 @@ public:
         const float t = ray->toi;
         // A ray that starts inside a box reports toi=0 with an uninitialized
         // normal (rpcBox::Raycast never writes n0 when all entry t0 < 0), so
-        // those hits are untrustworthy — skip them.
-        if (t <= 0.f) return true;
+        // those hits are untrustworthy. They are not a miss either: remember
+        // them as `inside` (see RayHit::inside) so a buried suspension
+        // hardpoint stays distinguishable from an airborne one — without ever
+        // overwriting a real hit (box order is not deterministic).
+        if (t <= 0.f) {
+            if (!sawInside && box->TestPoint(box->body->GetTransform(), ray->start)) {
+                sawInside = true;
+                insideCandidate.body = it != boxToBody->end() ? it->second : kInvalidBody;
+                insideCandidate.point = FromRpc(ray->start);
+                insideCandidate.userData = box->GetUserdata();
+                insideCandidate.friction = box->friction;
+            }
+            return true;
+        }
         // Closest hit, with exact distance ties broken by shape id: the answer
         // must not depend on which ray strategy (tree / grid+sweep) replied.
         const bool closer = !result.hit || t < ray->t - 1e-6f;
@@ -304,7 +331,20 @@ public:
     const std::unordered_map<const rpcBox*, BodyHandle>* boxToBody = nullptr;
     RayHit results[32];
     i32 resultUid[32];
+    // Per-ray "origin started inside a collider" candidates. A real hit on the
+    // same ray wins over them (see Finish()).
+    RayHit insideCandidate[32];
+    bool sawInside[32] = {};
     uint64_t leafTests = 0;  // TEMP probe
+
+    RayHit Finish(int rayIndex) const {
+        const RayHit& result = results[rayIndex];
+        if (result.hit || !sawInside[rayIndex]) return result;
+        RayHit out = insideCandidate[rayIndex];
+        out.hit = false;
+        out.inside = true;
+        return out;
+    }
 
     bool ReportShape(rpcBox* box) override {
         // The batch traversal always reports with the per-ray overload.
@@ -321,8 +361,22 @@ public:
         const float t = ray->toi;
         // A ray that starts inside a box reports toi=0 with an uninitialized
         // normal (rpcBox::Raycast never writes n0 when all entry t0 < 0), so
-        // those hits are untrustworthy — skip them.
-        if (t <= 0.f) return true;
+        // those hits are untrustworthy. They are not a miss either: remember
+        // them as `inside` (see RayHit::inside) so a buried suspension
+        // hardpoint stays distinguishable from an airborne one — without ever
+        // overwriting a real hit (box order is not deterministic).
+        if (t <= 0.f) {
+            if (!sawInside[rayIndex] &&
+                box->TestPoint(box->body->GetTransform(), ray->start)) {
+                sawInside[rayIndex] = true;
+                RayHit& cand = insideCandidate[rayIndex];
+                cand.body = it != boxToBody->end() ? it->second : kInvalidBody;
+                cand.point = FromRpc(ray->start);
+                cand.userData = box->GetUserdata();
+                cand.friction = box->friction;
+            }
+            return true;
+        }
         RayHit& result = results[rayIndex];
         // Closest hit per ray, ties broken by shape id (strategy-independent).
         const bool closer = !result.hit || t < ray->t - 1e-6f;
@@ -622,7 +676,7 @@ RayHit RushPhysicsCore::Raycast(const Vec3& origin, const Vec3& direction, float
     impl_->scene.RayCast(&callback, ray, ignore == kInvalidBody ? nullptr : impl_->bodies.Get(ignore));
     RpcRaycastProbeAdd(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
                        callback.leafTests);
-    return callback.result;
+    return callback.Finish();
 }
 
 void RushPhysicsCore::RaycastBatch(const Vec3* origins, const Vec3& direction, float maxDistance,
@@ -647,7 +701,7 @@ void RushPhysicsCore::RaycastBatch(const Vec3* origins, const Vec3& direction, f
     // Probe reports per-ray-equivalent numbers (amortized over count).
     RpcRaycastProbeAdd(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / count,
                        static_cast<double>(callback.leafTests) / count, nodes / count);
-    for (int j = 0; j < count; ++j) out[j] = callback.results[j];
+    for (int j = 0; j < count; ++j) out[j] = callback.Finish(j);
 }
 
 std::vector<ContactEvent> RushPhysicsCore::DrainContacts() {

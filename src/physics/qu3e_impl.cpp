@@ -124,7 +124,22 @@ public:
     BodyHandle ignore = kInvalidBody;
     const std::map<const q3Box*, BodyHandle>* boxToBody = nullptr;
     RayHit result;
+    // Candidate "the origin started inside this collider" report. It is only
+    // a candidate: a real hit further along the ray wins, because a hardpoint
+    // buried in a barrier still has the road underneath it.
+    RayHit insideCandidate;
+    bool sawInside = false;
     uint64_t leafTests = 0;  // TEMP probe
+
+    // Final answer: the closest real hit, else the buried report, else a miss.
+    RayHit Finish() const {
+        if (result.hit) return result;
+        if (!sawInside) return result;
+        RayHit out = insideCandidate;
+        out.hit = false;
+        out.inside = true;
+        return out;
+    }
 
     bool ReportShape(q3Box* box) override {
         ++leafTests;  // TEMP probe
@@ -135,8 +150,21 @@ public:
         const float t = ray->toi;
         // A ray that starts inside a box reports toi=0 with an uninitialized
         // normal (q3Box::Raycast never writes n0 when all entry t0 < 0), so
-        // those hits are untrustworthy — skip them.
-        if (t <= 0.f) return true;
+        // those hits are untrustworthy. They are not a miss either: remember
+        // them as `inside` (see RayHit::inside) so the caller can tell a
+        // buried suspension hardpoint from an airborne one — but do not
+        // overwrite a real hit with it (box order is not deterministic, and a
+        // hardpoint inside a barrier box still sees the road below).
+        if (t <= 0.f) {
+            if (!sawInside && box->TestPoint(box->body->GetTransform(), ray->start)) {
+                sawInside = true;
+                insideCandidate.body = it != boxToBody->end() ? it->second : kInvalidBody;
+                insideCandidate.point = FromQ3(ray->start);
+                insideCandidate.userData = box->GetUserdata();
+                insideCandidate.friction = box->friction;
+            }
+            return true;
+        }
         if (!result.hit || t < ray->t) {
             ray->t = t;  // prune anything farther than the best hit so far
             result.hit = true;
@@ -353,7 +381,7 @@ RayHit Qu3eWorld::Raycast(const Vec3& origin, const Vec3& direction, float maxDi
     impl_->scene.RayCast(&callback, ray);
     Qu3eRaycastProbeAdd(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
                         callback.leafTests);
-    return callback.result;
+    return callback.Finish();
 }
 
 void Qu3eWorld::RaycastBatch(const Vec3* origins, const Vec3& direction, float maxDistance,

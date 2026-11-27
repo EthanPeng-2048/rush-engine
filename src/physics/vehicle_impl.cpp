@@ -374,13 +374,16 @@ void Suspension::Step(const CarFrame& frame, BodyHandle chassis, float wheelRadi
                       float trackWidth, const std::array<Vec3, 4>& hardpoints, float camber[4],
                       float dt) {
     const Vec3 up = frame.up;
-    const float maxLen = params_.suspensionRestLength + params_.suspensionMaxTravel;
+    // Ray length covers the whole strut travel, bump stop included, so a
+    // bottomed-out corner still finds the road it is pushing against.
+    const float rayLen = params_.RayLength(wheelRadius);
+    const float maxLen = rayLen - wheelRadius;  // rest + full travel (miss report)
     // All four wheel rays share direction and distance (only the hardpoint
     // origins differ): one batch query = one broadphase traversal.
     Vec3 origins[4];
     for (int i = 0; i < 4; ++i) origins[i] = TransformPoint(frame.chassis, hardpoints[i]);
     RayHit hits[4];
-    frame.world->RaycastBatch(origins, -up, maxLen + wheelRadius, 4, chassis, hits);
+    frame.world->RaycastBatch(origins, -up, rayLen, 4, chassis, hits);
 
     for (int i = 0; i < 4; ++i) {
         // Static toe (front toeF, rear toeR) rotates the wheel frame around
@@ -400,15 +403,23 @@ void Suspension::Step(const CarFrame& frame, BodyHandle chassis, float wheelRadi
         const float k = IsFront(i) ? params_.springKf : params_.springKr;
         const float c = IsFront(i) ? params_.damperCf : params_.damperCr;
         auto& corner = st_.corner[i];
-        if (hit.hit && Dot(hit.normal, up) > 0.25f) {
-            const float distToContact = hit.fraction * (maxLen + wheelRadius);
-            const float suspLength = distToContact - wheelRadius;
+        // `inside` means the ray origin (the hardpoint) is already inside a
+        // collider, so there is no entry point or normal to trust. That is a
+        // bottomed-out corner, not a flying one: treat it as the deepest
+        // compression at the contact below the hub, which keeps the strut
+        // pushing the body back out. Reporting it as a miss would drop all
+        // four corners at once and free-fall the car through the road.
+        const bool buried = hit.inside;
+        if (buried || (hit.hit && Dot(hit.normal, up) > 0.25f)) {
+            const float suspLength =
+                buried ? params_.suspensionRestLength - params_.CompressionLimit()
+                       : hit.fraction * rayLen - wheelRadius;
             const float compression = Clampf(params_.suspensionRestLength - suspLength, -0.02f,
-                                             params_.suspensionMaxTravel);
+                                             params_.CompressionLimit());
             const float compressionRate =
                 (compression - corner.compression) / std::max(dt, 1e-5f);
 
-            float springForce = k * std::max(compression, 0.f);
+            const float springForce = params_.SpringForce(compression, k);
             float damperForce = c * compressionRate;
             // Only damp when compressing to avoid jacking.
             if (compressionRate < 0.f) damperForce *= 0.35f;
@@ -421,16 +432,19 @@ void Suspension::Step(const CarFrame& frame, BodyHandle chassis, float wheelRadi
             corner.grounded = true;
             corner.suspensionLength = suspLength;
             corner.compression = compression;
-            corner.contactPoint = hit.point;
-            corner.contactNormal = hit.normal;
+            // Without a trustworthy entry point the strut reaction acts right
+            // under the hub, against the body up axis.
+            corner.contactPoint = buried ? origins[i] : hit.point;
+            corner.contactNormal = buried ? up : hit.normal;
             corner.load = normalForce;
             corner.surface = SurfaceFromTag(hit.userData);
-            corner.contactVelocity = frame.world->GetVelocityAtPoint(chassis, hit.point).value_or(Vec3{});
+            corner.contactVelocity =
+                frame.world->GetVelocityAtPoint(chassis, corner.contactPoint).value_or(Vec3{});
             corner.wheelForward = wheelForward;
             corner.wheelRight = wheelRight;
 
             // Suspension force along the strut (chassis up).
-            (void)frame.world->ApplyForce(chassis, up * normalForce, hit.point);
+            (void)frame.world->ApplyForce(chassis, up * normalForce, corner.contactPoint);
         } else {
             corner.grounded = false;
             corner.suspensionLength = maxLen;
