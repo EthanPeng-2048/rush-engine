@@ -58,6 +58,10 @@ struct UiScreen {
     float rowHeight = 44.f;
     float valueColumnX = 340.f;  // Value rows: right-hand column offset from x
     bool dimBackground = true;
+    // Up/Down (and Left/Right on a digit wheel) wrap around the focusable rows.
+    // Screens that should stop at the ends (a short action list, a form) clear
+    // this — the game sets a flag, it never re-implements the movement.
+    bool wrapFocus = true;
 };
 
 enum class UiActionKind : std::uint8_t {

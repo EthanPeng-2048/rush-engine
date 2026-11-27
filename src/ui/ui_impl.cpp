@@ -29,13 +29,29 @@ const UiWidget* Focused(const UiScreen& screen) {
     return &screen.widgets[static_cast<std::size_t>(screen.cursor)];
 }
 
-// Step the focus over focusable rows in `dir` (+1/-1), stopping at the ends
-// (menus do not wrap: a wrap on the first Up press is how people lose a row).
+// Step the focus over focusable rows in `dir` (+1/-1). With
+// `UiScreen::wrapFocus` the walk continues from the opposite end, which is
+// what the existing menus do ((cursor+1) % rows); a screen that should stop
+// at the ends just clears the flag.
 void MoveFocus(UiScreen& screen, int dir) {
     const int count = static_cast<int>(screen.widgets.size());
+    if (count == 0) return;
+    const auto focusableAt = [&](int i) {
+        const UiWidget& widget = screen.widgets[static_cast<std::size_t>(i)];
+        return IsFocusable(widget.kind) && widget.enabled;
+    };
     for (int i = screen.cursor + dir; i >= 0 && i < count; i += dir) {
-        if (IsFocusable(screen.widgets[static_cast<std::size_t>(i)].kind) &&
-            screen.widgets[static_cast<std::size_t>(i)].enabled) {
+        if (focusableAt(i)) {
+            screen.cursor = i;
+            return;
+        }
+    }
+    if (!screen.wrapFocus) return;
+    // Wrap: enter the list from the other end and stop at the first row that
+    // can take focus; if none can, keep the current focus instead of parking
+    // it on a static row.
+    for (int i = dir > 0 ? 0 : count - 1; i != screen.cursor && i >= 0 && i < count; i += dir) {
+        if (focusableAt(i)) {
             screen.cursor = i;
             return;
         }
