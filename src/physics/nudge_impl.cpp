@@ -375,7 +375,32 @@ RayHit NudgeWorld::Raycast(const Vec3& origin, const Vec3& direction, float maxD
         from += dir * advance;
         traveled += advance;
     }
-    return {};
+
+    // nudge's ray_box rejects entry times below zero (collision.c:
+    // `if (tmin < 0.0f) return 0;`), so a ray whose origin lies inside a body
+    // comes back as a plain miss — it cannot tell "buried" from "airborne" on
+    // its own. Test containment explicitly against the (legacy single-box)
+    // collider and report `inside` instead: see RayHit::inside.
+    RayHit buried;
+    for (const auto& [handle, entry] : impl_->bodies) {
+        if (handle == ignore) continue;
+        const Vec3 e = entry.desc.halfExtents;
+        const Vec3 centre = FromNudge(body_get_position(impl_->world, entry.body));
+        const Vec3 delta = origin - centre;
+        if (Dot(delta, delta) > e.x * e.x + e.y * e.y + e.z * e.z) continue;
+        const Quat q = FromNudgeQuat(body_get_rotation(impl_->world, entry.body));
+        const Vec3 local = RotateInv(q, delta);
+        if (std::fabs(local.x) > e.x || std::fabs(local.y) > e.y || std::fabs(local.z) > e.z) {
+            continue;
+        }
+        buried.inside = true;
+        buried.body = handle;
+        buried.point = origin;   // origin is inside; no entry point exists
+        buried.userData = entry.desc.userData;
+        buried.friction = entry.desc.friction;
+        return buried;
+    }
+    return buried;  // all flags false = genuine miss
 }
 
 void NudgeWorld::RaycastBatch(const Vec3* origins, const Vec3& direction, float maxDistance,
