@@ -8,6 +8,14 @@
 
 #include <chrono>
 
+// Spin-hint: SSE pause on x86, no-op elsewhere (WASM / ARM).
+#if defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64)
+#include <immintrin.h>
+#define RPC_CPU_PAUSE() _mm_pause()
+#else
+#define RPC_CPU_PAUSE() ((void)0)
+#endif
+
 //--------------------------------------------------------------------------------------------------
 // rpcWorkerPool
 //--------------------------------------------------------------------------------------------------
@@ -72,7 +80,7 @@ void rpcWorkerPool::Run( void ( *fn )( i32, void* ), void* arg, i32 taskCount )
 	const i32 want = taskCount;
 	while ( m_tasksDone.load( std::memory_order_acquire ) != want )
 	{
-		_mm_pause( );
+		RPC_CPU_PAUSE( );
 	}
 }
 
@@ -92,7 +100,7 @@ void rpcWorkerPool::WorkerMain( )
 			              m_seq.load( std::memory_order_acquire ) == mySeq;
 			      ++i )
 			{
-				_mm_pause( );
+				RPC_CPU_PAUSE( );
 			}
 			if ( m_seq.load( std::memory_order_acquire ) == mySeq )
 				std::this_thread::yield( );
