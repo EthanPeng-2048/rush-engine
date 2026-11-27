@@ -1,4 +1,5 @@
 module;
+#include <cstdint>
 #include <cstring>
 #include "raylib.h"
 
@@ -93,6 +94,15 @@ void RaylibInputSource::Poll(RawFrame& out) {
     out.mouseButtons[0] = ::IsMouseButtonDown(MOUSE_BUTTON_LEFT);
     out.mouseButtons[1] = ::IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
     out.mouseButtons[2] = ::IsMouseButtonDown(MOUSE_BUTTON_MIDDLE);
+
+    // Text channel: raylib queues codepoints for the current frame. Drain the
+    // queue so a burst smaller than the buffer is never half-consumed.
+    out.textCount = 0;
+    while (out.textCount < sizeof(out.text) / sizeof(out.text[0])) {
+        const int cp = ::GetCharPressed();
+        if (cp <= 0) break;
+        out.text[out.textCount++] = static_cast<std::uint32_t>(cp);
+    }
 }
 
 }  // namespace apex

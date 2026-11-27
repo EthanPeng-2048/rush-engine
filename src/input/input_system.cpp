@@ -282,6 +282,21 @@ float EntryValue(const InputRegistry::Entry& e, const RawFrame& f) {
 }  // namespace
 
 void InputSystem::RunRecognizers(const RawFrame& frame, double tSec) {
+    // Text channel first: typed codepoints and the backspace edge are raw
+    // device state (not registered actions), so they are collected here and
+    // drained by Consume on the caller's thread.
+    {
+        std::lock_guard lock(mutex_);
+        for (std::uint8_t i = 0; i < frame.textCount; ++i) pendingText_.push_back(frame.text[i]);
+        if (pendingText_.size() > 256) {
+            pendingText_.erase(pendingText_.begin(),
+                               pendingText_.begin() + static_cast<std::ptrdiff_t>(pendingText_.size() - 256));
+        }
+        const bool backspace = frame.keys[static_cast<size_t>(KeyCode::Backspace)];
+        if (backspace && !backspacePrev_) pendingBackspace_ = true;
+        backspacePrev_ = backspace;
+    }
+
     std::vector<InputRegistry::Entry> entries;
     std::string ctx;
     {
@@ -426,6 +441,41 @@ void InputSystem::Consume(InputState& out) {
     out.menuRight = false;
     out.menuSelect = false;
     out.menuBack = false;
+    out.textLen = 0;
+    out.textBackspace = false;
+
+    // Typed text: encode the codepoints collected on the input thread into the
+    // UTF-8 buffer (dropped when it does not fit — a name field caps far
+    // earlier, so this is only a safety net).
+    {
+        std::lock_guard lock(mutex_);
+        for (const std::uint32_t cp : pendingText_) {
+            char utf8[4];
+            int len = 0;
+            if (cp < 0x80u) {
+                utf8[len++] = static_cast<char>(cp);
+            } else if (cp < 0x800u) {
+                utf8[len++] = static_cast<char>(0xC0 | (cp >> 6));
+                utf8[len++] = static_cast<char>(0x80 | (cp & 0x3Fu));
+            } else if (cp < 0x10000u) {
+                utf8[len++] = static_cast<char>(0xE0 | (cp >> 12));
+                utf8[len++] = static_cast<char>(0x80 | ((cp >> 6) & 0x3Fu));
+                utf8[len++] = static_cast<char>(0x80 | (cp & 0x3Fu));
+            } else if (cp <= 0x10FFFFu) {
+                utf8[len++] = static_cast<char>(0xF0 | (cp >> 18));
+                utf8[len++] = static_cast<char>(0x80 | ((cp >> 12) & 0x3Fu));
+                utf8[len++] = static_cast<char>(0x80 | ((cp >> 6) & 0x3Fu));
+                utf8[len++] = static_cast<char>(0x80 | (cp & 0x3Fu));
+            }
+            if (len == 0) continue;
+            if (static_cast<int>(out.textLen) + len > static_cast<int>(sizeof(out.text)) - 1) break;
+            for (int i = 0; i < len; ++i) out.text[out.textLen++] = utf8[i];
+        }
+        out.text[out.textLen] = '\0';
+        pendingText_.clear();
+        out.textBackspace = pendingBackspace_;
+        pendingBackspace_ = false;
+    }
 
     InputBus().Drain([&](const InputEvent& ev) {
         const std::string_view name = InputNameOf(ev.nameId);

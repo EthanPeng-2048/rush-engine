@@ -51,6 +51,7 @@ add_library(rush-engine STATIC
     src/physics/collision_bus.cpp
     src/physics/raycast_probe.cpp  # TEMP probe — remove with the perf work
     src/render/null_impl.cpp
+    src/ui/ui_impl.cpp
 )
 target_sources(rush-engine PUBLIC
     FILE_SET CXX_MODULES
@@ -62,6 +63,7 @@ target_sources(rush-engine PUBLIC
         modules/events.cppm
         modules/job.cppm
         modules/runtime.cppm
+        modules/ui.cppm
 )
 
 add_library(rush::engine ALIAS rush-engine)

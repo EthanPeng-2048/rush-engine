@@ -84,6 +84,13 @@ struct RayHit {
     void* userData = nullptr;
     // Coulomb mu of the hit surface (from the hit body/shape). 0 when miss.
     float friction = 0.f;
+    // The ray origin started INSIDE the reported collider, so there is no
+    // trustworthy entry point or normal. Backends that can detect it set this
+    // instead of silently reporting a miss: "buried" and "airborne" are
+    // different physical states and callers must not conflate them (a car
+    // whose suspension rays start inside the road is bottomed out, not
+    // flying). hit stays false for such an entry — check `inside` first.
+    bool inside = false;
 };
 
 // Contact reported for damage mapping. `localPointA/B` are contact points in
@@ -602,6 +609,39 @@ enum class WingMode : int {
     XMode = 1,   // 2026 low-drag (straights)
 };
 
+// Fitted vehicle features. This is the single gate for "does this car have the
+// system at all" — it replaces the old per-feature bools, so a subsystem, its
+// telemetry, the HUD and the network rules all agree by construction. A clear
+// bit means the part is NOT on the car: no state, no force, no readout.
+enum class VehicleCapability : std::uint8_t {
+    None = 0,
+    Drs = 1u << 0,          // rear-wing flap on straights (classic rules)
+    ActiveAero = 1u << 1,   // X/Z wing modes (2026 rules)
+    Ers = 1u << 2,          // hybrid energy store: regen under braking + deploy
+    Overtake = 1u << 3,     // overtake deployment profile (2026 rules)
+};
+
+constexpr std::uint8_t CapabilityBit(VehicleCapability c) {
+    return static_cast<std::uint8_t>(c);
+}
+
+constexpr std::uint8_t operator|(VehicleCapability a, VehicleCapability b) {
+    return static_cast<std::uint8_t>(a) | static_cast<std::uint8_t>(b);
+}
+
+constexpr std::uint8_t operator|(std::uint8_t mask, VehicleCapability c) {
+    return mask | CapabilityBit(c);
+}
+
+constexpr std::uint8_t& operator|=(std::uint8_t& mask, VehicleCapability c) {
+    mask = static_cast<std::uint8_t>(mask | CapabilityBit(c));
+    return mask;
+}
+
+constexpr bool HasCapability(std::uint8_t mask, VehicleCapability c) {
+    return (mask & CapabilityBit(c)) != 0;
+}
+
 // Driver aids, graded like the F1 games: Off / Sport / Full.
 enum class AssistLevel : int {
     Off = 0,
@@ -850,12 +890,12 @@ struct VehicleParams {
     // No-damage mode: collisions still bounce, but parts never lose health.
     bool damageEnabled = true;
 
-    // Season rules ([season] in config): classic (DRS) and 2026 (active
-    // aero + override) never mix. Game sets these at spawn; the vehicle
-    // gates activation itself so a stale input can't leak a disabled system.
-    bool drsEnabled = true;          // classic: DRS on straights
-    bool activeAeroEnabled = false;  // 2026: X/Z wing modes (V)
-    bool overtakeEnabled = false;    // 2026: manual override deploy (SHIFT)
+    // Fitted features (see VehicleCapability). A car without a bit has no such
+    // system at all: the subsystem must be a no-op (no state, no force, no
+    // telemetry), which is what lets the HUD/UI decide visibility from the car
+    // itself instead of from season globals. Game sets this once at spawn
+    // (SpawnRacersInto); L2 never reads a season/rule global.
+    std::uint8_t capabilities = CapabilityBit(VehicleCapability::Drs);
 };
 
 // Live state of one wheel.

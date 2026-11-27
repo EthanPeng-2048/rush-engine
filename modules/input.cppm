@@ -62,6 +62,10 @@ struct RawFrame {
     float mouseX = 0.f, mouseY = 0.f;
     float mouseWheel = 0.f;
     bool mouseButtons[3] = {};
+    // Text typed this tick, as Unicode codepoints (raylib GetCharPressed).
+    // Gesture recognizers ignore this channel; UI text fields consume it.
+    std::uint32_t text[32] = {};
+    std::uint8_t textCount = 0;
 };
 
 // Per-frame semantic snapshot the game builds from drained events + hold
@@ -89,6 +93,14 @@ struct InputState {
     bool menuRight = false;
     bool menuSelect = false;
     bool menuBack = false;
+
+    // Typed text since the previous Consume (UTF-8 bytes, NUL-terminated by
+    // textLen) and the one-frame backspace edge. Skip is a raw device key, not
+    // a registered action: menus own it while a text field is focused, so it
+    // is deliberately not routed through the gesture registry.
+    char text[96] = {};
+    std::uint8_t textLen = 0;
+    bool textBackspace = false;
 };
 
 // --- Registration table ------------------------------------------------------
@@ -240,6 +252,10 @@ private:
 
     std::string activeContext_;
     mutable std::mutex mutex_;
+    // Text channel: collected on the input thread, drained by Consume.
+    std::vector<std::uint32_t> pendingText_;
+    bool pendingBackspace_ = false;
+    bool backspacePrev_ = false;
 
     std::thread thread_;
     std::atomic<bool> running_{false};

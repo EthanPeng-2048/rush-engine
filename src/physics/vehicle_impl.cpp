@@ -969,11 +969,12 @@ void Vehicle::Update(const CarInput& input, float dt) {
     const DriverControls::Output ctrl = controls_.Process(input, frame, params_);
 
     // --- Mode latching (wing mode / DRS) ----------------------------------
-    if (params_.activeAeroEnabled && ctrl.wingToggle && !wingTogglePrev_) {
+    if (HasCapability(params_.capabilities, VehicleCapability::ActiveAero) && ctrl.wingToggle &&
+        !wingTogglePrev_) {
         state_.wingMode = (state_.wingMode == WingMode::ZMode) ? WingMode::XMode : WingMode::ZMode;
     }
     wingTogglePrev_ = ctrl.wingToggle;
-    state_.drsAvailable = params_.drsEnabled && ctrl.drsZone;
+    state_.drsAvailable = HasCapability(params_.capabilities, VehicleCapability::Drs) && ctrl.drsZone;
     state_.drsActive = ctrl.drsRequest && state_.drsAvailable;
 
     // --- 2. Suspension: per-corner loads + contacts -------------------------
@@ -997,7 +998,8 @@ void Vehicle::Update(const CarInput& input, float dt) {
     // standstill idle so the engine can hold rpm without shoving the car
     // (auto-clutch behaviour). TCS/ESC enter as throttle cut / brake reserve.
     const float ersPower =
-        engine_.UpdateErc(input, ctrl.throttle, ctrl.brake, frame.speed, params_.overtakeEnabled, dt);
+        engine_.UpdateErc(input, ctrl.throttle, ctrl.brake, frame.speed,
+                          HasCapability(params_.capabilities, VehicleCapability::Overtake), dt);
     const int gearPre = gearbox_.StateRef().gear;
     const float ratioPre = params_.gearbox.gearRatios[static_cast<size_t>(std::max(0, gearPre - 1))];
     const float totalRatioPre = ratioPre * params_.gearbox.finalDrive;
