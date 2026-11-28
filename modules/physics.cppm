@@ -940,6 +940,14 @@ struct VehicleParams {
     std::uint8_t capabilities = CapabilityBit(VehicleCapability::Drs);
 };
 
+// Digest of every parameter value that changes the simulation, so two machines
+// can prove they run the same physics (the LAN build signature folds it in).
+// Covers member values only — never the object's bytes: the struct ends in
+// one-byte members, so its tail padding is uninitialised, and hashing that made
+// the signature differ between runs of the very same executable.
+// `seed` lets the caller mix in its own version tag.
+std::uint32_t ParamsDigest(const VehicleParams& params, std::uint32_t seed);
+
 // Live state of one wheel.
 struct WheelState {
     bool grounded = false;

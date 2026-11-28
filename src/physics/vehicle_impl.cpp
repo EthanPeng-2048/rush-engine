@@ -2,6 +2,7 @@ module;
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <string>
 #include <vector>
 #include "CarModelData.h"
@@ -25,7 +26,92 @@ constexpr int kFrontLeft = 0, kFrontRight = 1, kRearLeft = 2, kRearRight = 3;
 
 bool IsFront(int wheel) { return wheel < 2; }
 
+// FNV-1a over one value's representation. Applied to scalars and to the
+// parameter sub-structs, which hold nothing but 4-byte members — the layout
+// asserts below keep that true, so no uninitialised padding can reach the
+// digest.
+template <typename T>
+std::uint32_t HashValue(std::uint32_t h, const T& value) {
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(&value);
+    for (std::size_t i = 0; i < sizeof(T); ++i) {
+        h ^= bytes[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
 }  // namespace
+
+// ParamsDigest hashes whole sub-structs as byte spans, which is exact only
+// while each one holds nothing but 4-byte members and its last member ends
+// exactly on sizeof: every byte of the span then belongs to a member. These
+// fire when a member is added, removed or reordered — extend the digest list
+// below to match.
+static_assert(offsetof(TireModel::Params, minGrip) + sizeof(float) == sizeof(TireModel::Params),
+              "TireModel::Params layout moved: review ParamsDigest");
+static_assert(offsetof(EngineParams, idleHoldTorque) + sizeof(float) == sizeof(EngineParams),
+              "EngineParams layout moved: review ParamsDigest");
+static_assert(offsetof(ErsParams, overtakeMultiplier) + sizeof(float) == sizeof(ErsParams),
+              "ErsParams layout moved: review ParamsDigest");
+static_assert(offsetof(TransmissionParams, brakeForceMax) + sizeof(float) == sizeof(TransmissionParams),
+              "TransmissionParams layout moved: review ParamsDigest");
+static_assert(offsetof(DifferentialParams, deltaMax) + sizeof(float) == sizeof(DifferentialParams),
+              "DifferentialParams layout moved: review ParamsDigest");
+static_assert(offsetof(SuspensionParams, rollSteerF) + sizeof(float) == sizeof(SuspensionParams),
+              "SuspensionParams layout moved: review ParamsDigest");
+static_assert(offsetof(AeroKitParams, copHeight) + sizeof(float) == sizeof(AeroKitParams),
+              "AeroKitParams layout moved: review ParamsDigest");
+static_assert(offsetof(DriverAssistanceParams, escBetaDeepSport) + sizeof(float) ==
+                  sizeof(DriverAssistanceParams),
+              "DriverAssistanceParams layout moved: review ParamsDigest");
+static_assert(offsetof(DriverControlsParams, steerLevel) + sizeof(AssistLevel) ==
+                  sizeof(DriverControlsParams),
+              "DriverControlsParams layout moved: review ParamsDigest");
+static_assert(offsetof(PartBoxDesc, halfExtents) + sizeof(Vec3) == sizeof(PartBoxDesc),
+              "PartBoxDesc layout moved: review ParamsDigest");
+// Top level: one assert per joint, so a new member anywhere trips one of them.
+static_assert(alignof(VehicleParams) == 4, "ParamsDigest spans assume 4-byte members");
+static_assert(offsetof(VehicleParams, damageEnabled) ==
+                  offsetof(VehicleParams, controls) + sizeof(DriverControlsParams),
+              "VehicleParams layout moved: review ParamsDigest");
+static_assert(offsetof(VehicleParams, capabilities) ==
+                  offsetof(VehicleParams, damageEnabled) + sizeof(bool),
+              "VehicleParams layout moved: review ParamsDigest");
+// The last two bytes of the struct are alignment padding, not a member: they
+// hold whatever the stack left there. Hashing the object as a whole (what this
+// digest deliberately does not do) made two machines on the same exe disagree.
+static_assert(sizeof(VehicleParams) == offsetof(VehicleParams, capabilities) + 1 + 2,
+              "VehicleParams tail padding changed: review ParamsDigest");
+
+std::uint32_t ParamsDigest(const VehicleParams& p, std::uint32_t seed) {
+    std::uint32_t h = seed;
+    // Chassis
+    h = HashValue(h, p.mass);
+    h = HashValue(h, p.wheelbase);
+    h = HashValue(h, p.trackWidth);
+    h = HashValue(h, p.wheelRadius);
+    h = HashValue(h, p.chassisHalfX);
+    h = HashValue(h, p.chassisHalfY);
+    h = HashValue(h, p.chassisHalfZ);
+    h = HashValue(h, p.partBoxes);
+    h = HashValue(h, p.chassisBox);
+    // Tires
+    h = HashValue(h, p.frontTire);
+    h = HashValue(h, p.rearTire);
+    // Components
+    h = HashValue(h, p.engine);
+    h = HashValue(h, p.ers);
+    h = HashValue(h, p.gearbox);
+    h = HashValue(h, p.differential);
+    h = HashValue(h, p.suspension);
+    h = HashValue(h, p.aero);
+    h = HashValue(h, p.assists);
+    h = HashValue(h, p.controls);
+    // Fitted features
+    h = HashValue(h, p.damageEnabled);
+    h = HashValue(h, p.capabilities);
+    return h;
+}
 
 TireModel::TireModel(const Params& params) : params_(params) {}
 
