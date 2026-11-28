@@ -585,14 +585,18 @@ rush::Result<Transform> RushPhysicsCore::GetTransform(BodyHandle handle) const {
 
 rush::Result<void> RushPhysicsCore::SetTransform(BodyHandle handle, const Transform& transform) {
     EX_TRY(body, FindBody(impl_->bodies, handle));
+    // GetTransform() hands back the body ORIGIN, SetTransform() wants the mass
+    // center (see the qu3e adapter) — fold the offset back in or every set
+    // shifts a dynamic body by R * localCenter.
+    const Vec3 center =
+        transform.position + Rotate(transform.rotation, FromRpc((*body)->GetLocalCenter()));
     const Quat& q = transform.rotation;
     const float sinHalf = std::sqrt(std::max(0.f, 1.f - q.w * q.w));
     if (sinHalf > 1e-5f) {
-        (*body)->SetTransform(ToRpc(transform.position),
-                              rpcVec3{q.x / sinHalf, q.y / sinHalf, q.z / sinHalf},
+        (*body)->SetTransform(ToRpc(center), rpcVec3{q.x / sinHalf, q.y / sinHalf, q.z / sinHalf},
                               2.f * std::atan2(sinHalf, q.w));
     } else {
-        (*body)->SetTransform(ToRpc(transform.position));
+        (*body)->SetTransform(ToRpc(center));
     }
     return {};
 }

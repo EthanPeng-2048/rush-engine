@@ -291,14 +291,19 @@ rush::Result<Transform> Qu3eWorld::GetTransform(BodyHandle handle) const {
 rush::Result<void> Qu3eWorld::SetTransform(BodyHandle handle, const Transform& transform) {
     const auto it = impl_->bodies.find(handle);
     if (it == impl_->bodies.end()) return {};
+    q3Body* body = it->second;
+    // GetTransform() hands back the body ORIGIN, SetTransform() wants the mass
+    // center. Feeding one straight into the other shifted every dynamic body by
+    // R * localCenter on each set — 16 cm on a car, re-applied on every rollback.
+    const Vec3 center =
+        transform.position + Rotate(transform.rotation, FromQ3(body->GetLocalCenter()));
     const Quat& q = transform.rotation;
     const float sinHalf = std::sqrt(std::max(0.f, 1.f - q.w * q.w));
     if (sinHalf > 1e-5f) {
-        it->second->SetTransform(ToQ3(transform.position),
-                                 q3Vec3{q.x / sinHalf, q.y / sinHalf, q.z / sinHalf},
-                                 2.f * std::atan2(sinHalf, q.w));
+        body->SetTransform(ToQ3(center), q3Vec3{q.x / sinHalf, q.y / sinHalf, q.z / sinHalf},
+                           2.f * std::atan2(sinHalf, q.w));
     } else {
-        it->second->SetTransform(ToQ3(transform.position));
+        body->SetTransform(ToQ3(center));
     }
     return {};
 }

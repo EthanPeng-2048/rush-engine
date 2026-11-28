@@ -88,6 +88,11 @@ public:
 	void SetAngularVelocity( const q3Vec3 v );
 	bool CanCollide( const q3Body *other ) const;
 	const q3Transform GetTransform( ) const;
+	// Local-space mass center. GetTransform( ) reports the body ORIGIN
+	// ( worldCenter - R * localCenter ) while SetTransform( ) takes the mass
+	// center, so any caller converting one into the other needs this: a get ->
+	// set round trip is only identity with the offset folded back in.
+	const q3Vec3& GetLocalCenter( ) const { return m_localCenter; }
 	i32 GetFlags( ) const;
 	void SetLayers( i32 layers );
 	i32 GetLayers( ) const;

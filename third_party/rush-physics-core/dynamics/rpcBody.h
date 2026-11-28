@@ -77,6 +77,10 @@ public:
 	// aggregated into one linear + one angular application.
 	void ApplyAngularImpulse( const rpcVec3& worldImpulse );
 	const rpcVec3& GetWorldCenter( ) const { return m_worldCenter; }
+	// GetTransform( ) reports the body ORIGIN ( worldCenter - R * localCenter )
+	// while SetTransform( ) takes the mass center: converting one into the other
+	// needs this offset, otherwise a get -> set round trip shifts the body.
+	const rpcVec3& GetLocalCenter( ) const { return m_localCenter; }
 	void ApplyTorque( const rpcVec3& torque );
 	void SetToAwake( );
 	void SetToSleep( );
