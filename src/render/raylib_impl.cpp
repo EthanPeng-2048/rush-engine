@@ -20,9 +20,11 @@ namespace {
 // We embed two GLSL variants because desktop raylib is OpenGL 3.3 and the
 // emscripten build is WebGL2 (GLES 3.0). raylib binds the standard attribute
 // and uniform names (vertexPosition, matModel, colDiffuse, texture0, mvp).
+// `#version` must be the very first characters of each source: ANGLE (WebGL)
+// rejects a leading newline outright, while desktop drivers happened to tolerate
+// it — which is why the web build aborted on shader compile.
 #if defined(__EMSCRIPTEN__)
-constexpr const char* kLitVert = R"GLSL(
-#version 300 es
+constexpr const char* kLitVert = R"GLSL(#version 300 es
 precision highp float;
 in vec3 vertexPosition;
 in vec2 vertexTexCoord;
@@ -43,8 +45,7 @@ void main() {
     gl_Position = mvp * vec4(vertexPosition, 1.0);
 }
 )GLSL";
-constexpr const char* kLitFrag = R"GLSL(
-#version 300 es
+constexpr const char* kLitFrag = R"GLSL(#version 300 es
 precision highp float;
 in vec2 fragTexCoord;
 in vec3 fragNormal;
@@ -72,8 +73,7 @@ void main() {
 }
 )GLSL";
 #else
-constexpr const char* kLitVert = R"GLSL(
-#version 330
+constexpr const char* kLitVert = R"GLSL(#version 330
 in vec3 vertexPosition;
 in vec2 vertexTexCoord;
 in vec3 vertexNormal;
@@ -93,8 +93,7 @@ void main() {
     gl_Position = mvp * vec4(vertexPosition, 1.0);
 }
 )GLSL";
-constexpr const char* kLitFrag = R"GLSL(
-#version 330
+constexpr const char* kLitFrag = R"GLSL(#version 330
 in vec2 fragTexCoord;
 in vec3 fragNormal;
 in vec3 fragPos;
