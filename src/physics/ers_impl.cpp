@@ -1,5 +1,6 @@
 module;
 #include <algorithm>
+#include <cstdint>
 
 module rush.engine.physics;
 import rush.engine.core;

@@ -23,6 +23,11 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang")
         target_compile_options(nudge PRIVATE -std=c23 -ffp-contract=off -msse4.1 -msimd128)
     else()
         target_compile_options(nudge PRIVATE -std=c23 -ffp-contract=off -msse4.1)
+        if(NOT WIN32)
+            # Strict -std=c23 makes glibc hide the POSIX declarations nudge
+            # needs (clock_gettime in perf.h, pthread_* in threads.h).
+            target_compile_definitions(nudge PRIVATE _POSIX_C_SOURCE=200809L)
+        endif()
     endif()
 elseif(MSVC)
     target_compile_options(nudge PRIVATE /std:clatest /experimental:c11atomics /fp:precise)
